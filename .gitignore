@@ -1,4 +1,9 @@
-#Maven
+
+# ==========================================
+# CommerceCore Backend - Git Ignore
+# ==========================================
+
+# Maven / Quarkus
 target/
 pom.xml.tag
 pom.xml.releaseBackup
@@ -6,14 +11,27 @@ pom.xml.versionsBackup
 release.properties
 .flattened-pom.xml
 
+# Maven diagnostic cache (Codex)
+.mvn/diagnostic-cache/
+
+# Maven Wrapper downloaded distributions
+.mvn/wrapper/dists/
+
+# Quarkus local generated files
+.quarkus/
+
+# ==========================================
+# IDEs
+# ==========================================
+
 # Eclipse
 .project
 .classpath
 .settings/
 bin/
 
-# IntelliJ
-.idea
+# IntelliJ IDEA
+.idea/
 *.ipr
 *.iml
 *.iws
@@ -22,24 +40,53 @@ bin/
 nb-configuration.xml
 
 # Visual Studio Code
-.vscode
+.vscode/
 .factorypath
 
-# OSX
+# ==========================================
+# Operating Systems
+# ==========================================
+
+# macOS
 .DS_Store
 
-# Vim
+# Windows
+Thumbs.db
+Desktop.ini
+
+# ==========================================
+# Temporary files
+# ==========================================
 *.swp
 *.swo
-
-# patch
 *.orig
 *.rej
+*.tmp
+*.bak
 
-# Local environment
+# ==========================================
+# Logs and diagnostic outputs
+# ==========================================
+*.log
+logs/
+*.hprof
+
+# ==========================================
+# Secrets and local configuration
+# ==========================================
+
+# Environment variables
 .env
+.env.*
+!.env.example
 
-# Plugin directory
-/.quarkus/cli/plugins/
-# TLS Certificates
+# Local overrides
+*.local.properties
+
+# Local TLS certificates
 .certs/
+
+# ==========================================
+# Quarkus CLI
+# ==========================================
+/.quarkus/cli/plugins/
