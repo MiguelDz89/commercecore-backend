@@ -1,0 +1,21 @@
+# PostgreSQL local persistente, solo para desarrollo.
+# Antes de ejecutar, definir POSTGRES_PASSWORD en el entorno de la terminal.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: commercecore-postgres-dev
+    environment:
+      POSTGRES_DB: commercecore_dev
+      POSTGRES_USER: commercecore_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD antes de iniciar}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - commercecore_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commercecore -d commercecore_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  commercecore_pgdata:
