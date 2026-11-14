@@ -1,4 +1,4 @@
-package com.commercecore.diaz;
+package com.commercecore.diaz.demo.api;
 
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;

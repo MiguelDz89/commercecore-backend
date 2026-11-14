@@ -1,4 +1,4 @@
-package com.commercecore.diaz;
+package com.commercecore.diaz.platform.health;
 
 import org.eclipse.microprofile.health.HealthCheck;
 import org.eclipse.microprofile.health.HealthCheckResponse;

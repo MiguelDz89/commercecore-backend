@@ -1,4 +1,4 @@
-package com.commercecore.diaz;
+package com.commercecore.diaz.demo.api;
 
 import io.quarkus.test.junit.QuarkusIntegrationTest;
 
