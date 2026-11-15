@@ -1,6 +1,7 @@
 package com.commercecore.diaz.identity.infrastructure.persistence;
 
 import com.commercecore.diaz.identity.application.AuthorizationEvaluationException;
+import com.commercecore.diaz.identity.application.AuthorizationIntegrityException;
 import com.commercecore.diaz.identity.application.CurrentActor;
 import com.commercecore.diaz.identity.application.TenantAuthorizationService;
 import com.commercecore.diaz.identity.application.TenantPermissionDecision;
@@ -32,12 +33,12 @@ class TenantAuthorizationPersistenceTest {
         UUID roleA = role(f.tenantA, "ROLE_A");
         UUID roleB = role(f.tenantB, "ROLE_B");
         assign(f.tenantA, membershipA, roleA, "TENANT_READ");
-        assign(f.tenantB, membershipB, roleB, "TENANT_MANAGE");
+        assign(f.tenantB, membershipB, roleB, "PRODUCT_READ");
         var authorization = service(Optional.of(f.actor), false);
 
         assertEquals(TenantPermissionDecision.ALLOW, authorization.hasPermission(f.tenantA, "TENANT_READ"));
         assertEquals(TenantPermissionDecision.DENY, authorization.hasPermission(f.tenantA, "TENANT_MANAGE"));
-        assertEquals(TenantPermissionDecision.ALLOW, authorization.hasPermission(f.tenantB, "TENANT_MANAGE"));
+        assertEquals(TenantPermissionDecision.ALLOW, authorization.hasPermission(f.tenantB, "PRODUCT_READ"));
         assertEquals(TenantPermissionDecision.DENY, authorization.hasPermission(f.tenantB, "TENANT_READ"));
         assertEquals(TenantPermissionDecision.DENY, authorization.hasPermission(f.tenantA, "USER_MANAGE"));
         assertEquals(TenantPermissionDecision.DENY, service(Optional.of(new ActorId("https://other.example", f.actor.subject())), false)
@@ -45,6 +46,37 @@ class TenantAuthorizationPersistenceTest {
         assertEquals(TenantPermissionDecision.DENY, service(Optional.of(new ActorId(ISSUER, "missing-" + UUID.randomUUID())), false)
                 .hasPermission(f.tenantA, "TENANT_READ"));
         assertEquals(TenantPermissionDecision.DENY, service(Optional.empty(), false).hasPermission(f.tenantA, "TENANT_READ"));
+    }
+
+    @Test
+    @TestTransaction
+    void invalidRolesFailClosedEvenAlongsideValidRolesAndRemainTenantScoped() throws SQLException {
+        Fixture f=fixture();
+        UUID a=membership(f.user,f.tenantA,"ACTIVE"), b=membership(f.user,f.tenantB,"ACTIVE");
+        UUID admin=role(f.tenantA,"TENANT_ADMIN"), valid=role(f.tenantA,"READER"), otherAdmin=role(f.tenantB,"TENANT_ADMIN");
+        assign(f.tenantA,a,admin,"TENANT_READ");
+        exec("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,'TENANT_MANAGE'),(?,?,'USER_MANAGE')",f.tenantA,admin,f.tenantA,admin);
+        assign(f.tenantA,a,valid,"PRODUCT_READ");
+        assign(f.tenantB,b,otherAdmin,"TENANT_READ");
+        exec("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,'TENANT_MANAGE'),(?,?,'USER_MANAGE')",f.tenantB,otherAdmin,f.tenantB,otherAdmin);
+        var auth=service(Optional.of(f.actor),false);
+        assertEquals(TenantPermissionDecision.ALLOW,auth.hasPermission(f.tenantA,"TENANT_MANAGE"));
+        assertEquals(TenantPermissionDecision.ALLOW,auth.hasPermission(f.tenantB,"USER_MANAGE"));
+        exec("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,'PRODUCT_UPDATE')",f.tenantA,admin);
+        assertThrows(AuthorizationIntegrityException.class,() -> auth.hasPermission(f.tenantA,"PRODUCT_READ"));
+        assertThrows(AuthorizationIntegrityException.class,() -> auth.hasPermission(f.tenantA,"PRODUCT_UPDATE"));
+        assertEquals(TenantPermissionDecision.ALLOW,auth.hasPermission(f.tenantB,"USER_MANAGE"));
+        exec("DELETE FROM role_permission WHERE tenant_id=? AND role_id=? AND permission_code='PRODUCT_UPDATE'",f.tenantA,admin);
+        exec("DELETE FROM role_permission WHERE tenant_id=? AND role_id=? AND permission_code='USER_MANAGE'",f.tenantA,admin);
+        assertThrows(AuthorizationIntegrityException.class,() -> auth.hasPermission(f.tenantA,"TENANT_READ"));
+        exec("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,'USER_MANAGE')",f.tenantA,admin);
+        for (String forbidden : new String[]{"USER_MANAGE","TENANT_MANAGE"}) {
+            exec("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,?)",f.tenantA,valid,forbidden);
+            assertThrows(AuthorizationIntegrityException.class,() -> auth.hasPermission(f.tenantA,"PRODUCT_READ"));
+            assertThrows(AuthorizationIntegrityException.class,() -> auth.hasPermission(f.tenantA,forbidden));
+            exec("DELETE FROM role_permission WHERE tenant_id=? AND role_id=? AND permission_code=?",f.tenantA,valid,forbidden);
+        }
+        assertEquals(TenantPermissionDecision.ALLOW,auth.hasPermission(f.tenantA,"PRODUCT_READ"));
     }
 
     @Test

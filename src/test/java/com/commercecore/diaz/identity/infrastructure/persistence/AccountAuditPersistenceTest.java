@@ -81,6 +81,22 @@ class AccountAuditPersistenceTest {
     }
 
     @Test
+    @TestTransaction
+    void auditStoresPermissionSnapshotsInTheSameTransaction() throws SQLException {
+        UUID tenant = createTenant();
+        UUID actorId = service(actor()).provisionCurrentActor();
+        UUID role = UUID.randomUUID();
+        audit.record(new TenantAuditEvent(tenant, actorId, TenantAuditEvent.EntityType.ROLE, role,
+                TenantAuditEvent.Action.ROLE_PERMISSIONS_CHANGED, null, null,
+                java.util.Set.of("PRODUCT_READ"), java.util.Set.of("PRODUCT_UPDATE")));
+        assertEquals(1, count("""
+                SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=?
+                  AND before_data->'permissions' @> '["PRODUCT_READ"]'::jsonb
+                  AND after_data->'permissions' @> '["PRODUCT_UPDATE"]'::jsonb
+                """, tenant, role));
+    }
+
+    @Test
     void successfulAuditAndAccountRollBackTogetherWhenCallerFails() {
         UUID tenant = QuarkusTransaction.requiringNew().call(this::createTenant);
         ActorId actor = actor();

@@ -111,6 +111,103 @@ class OidcPlatformAuthorizationTest {
     }
 
     @Test
+    void rolePermissionChangeRollsBackThroughCdiWhenAuditFails() throws Exception {
+        String token = token(KeycloakRealmResource.MEMBER, "commercecore-api");
+        UUID user = UUID.fromString(given().auth().oauth2(token).get("/test-only-platform-authorization/account")
+                .then().statusCode(200).extract().asString());
+        UUID tenant=UUID.randomUUID(), member=UUID.randomUUID(), manager=UUID.randomUUID(), commercial=UUID.randomUUID(), role=UUID.randomUUID();
+        String suffix=tenant.toString().replace("-", ""), function="test_role_failure_"+suffix, trigger="test_role_trigger_"+suffix;
+        try {
+            try(var c=dataSource.getConnection(); var s=c.createStatement()) {
+                c.setAutoCommit(false);
+                s.execute("INSERT INTO tenant(tenant_id,slug,legal_name,display_name) VALUES ('"+tenant+"','role-"+tenant+"','Test','Test')");
+                s.execute("INSERT INTO tenant_membership(membership_id,tenant_id,user_id,status) VALUES ('"+member+"','"+tenant+"','"+user+"','ACTIVE')");
+                s.execute("INSERT INTO app_role(role_id,tenant_id,code,name) VALUES ('"+manager+"','"+tenant+"','TENANT_ADMIN','Manager'),('"+commercial+"','"+tenant+"','commercial','Commercial'),('"+role+"','"+tenant+"','reader','Reader')");
+                s.execute("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES ('"+tenant+"','"+manager+"','TENANT_READ'),('"+tenant+"','"+manager+"','TENANT_MANAGE'),('"+tenant+"','"+manager+"','USER_MANAGE'),('"+tenant+"','"+commercial+"','PRODUCT_READ'),('"+tenant+"','"+role+"','PRODUCT_READ')");
+                s.execute("INSERT INTO membership_role(tenant_id,membership_id,role_id) VALUES ('"+tenant+"','"+member+"','"+manager+"'),('"+tenant+"','"+member+"','"+commercial+"')");
+                s.execute("CREATE FUNCTION "+function+"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit test failure'; END $$");
+                s.execute("CREATE TRIGGER "+trigger+" BEFORE INSERT ON audit_event FOR EACH ROW WHEN (NEW.tenant_id = '"+tenant+"'::uuid) EXECUTE FUNCTION "+function+"()");
+                c.commit();
+            }
+            given().auth().oauth2(token).post("/test-only-platform-authorization/role/"+tenant+"/"+role+"/clear").then().statusCode(500);
+            try(var c=dataSource.getConnection(); var s=c.prepareStatement("SELECT count(*) FROM role_permission WHERE tenant_id=? AND role_id=? AND permission_code='PRODUCT_READ'")) {
+                s.setObject(1,tenant); s.setObject(2,role);
+                try(var rows=s.executeQuery()) { assertTrue(rows.next()); assertEquals(1,rows.getInt(1)); }
+            }
+        } finally {
+            try(var c=dataSource.getConnection(); var s=c.createStatement()) {
+                s.execute("DROP TRIGGER IF EXISTS "+trigger+" ON audit_event"); s.execute("DROP FUNCTION IF EXISTS "+function+"()");
+                s.execute("DELETE FROM membership_role WHERE tenant_id='"+tenant+"'");
+                s.execute("DELETE FROM role_permission WHERE tenant_id='"+tenant+"' AND role_id IN (SELECT role_id FROM app_role WHERE tenant_id='"+tenant+"' AND code<>'TENANT_ADMIN')");
+                s.execute("DELETE FROM tenant_membership WHERE tenant_id='"+tenant+"'");
+                s.execute("DELETE FROM app_role WHERE tenant_id='"+tenant+"' AND code<>'TENANT_ADMIN'");
+            }
+        }
+    }
+
+    @Test
+    void platformRoleOperationsUseVerifiedClientRolesAndLocalAuditAccount() throws Exception {
+        String platform = token(KeycloakRealmResource.ADMIN, "commercecore-api");
+        String manager = token(KeycloakRealmResource.TENANT, "commercecore-api");
+        String otherClient = token(KeycloakRealmResource.OTHER, "commercecore-api");
+        var otherClaims = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(otherClient.split("\\.")[1]));
+        boolean otherRole = false;
+        for (var role : otherClaims.path("resource_access").path("other-client").path("roles"))
+            otherRole |= "PLATFORM_SUPER_ADMIN".equals(role.asText());
+        assertTrue(otherRole, "Test token must contain the homonymous role from the other client");
+        String unprovisioned = token(KeycloakRealmResource.UNPROVISIONED, "commercecore-api");
+        String firstToken = token(KeycloakRealmResource.MEMBER, "commercecore-api");
+        UUID platformUser = provision(platform), managerUser = provision(manager), targetUser = provision(otherClient), firstUser = provision(firstToken);
+        UUID tenant=UUID.randomUUID(), first=UUID.randomUUID(), target=UUID.randomUUID(), managerMember=UUID.randomUUID();
+        UUID protectedRole=UUID.randomUUID();
+        try {
+            try (var c=dataSource.getConnection(); var s=c.createStatement()) {
+                c.setAutoCommit(false);
+                s.execute("INSERT INTO tenant(tenant_id,slug,legal_name,display_name) VALUES ('"+tenant+"','platform-"+tenant+"','Test','Test')");
+                s.execute("INSERT INTO tenant_membership(membership_id,tenant_id,user_id,status) VALUES ('"+first+"','"+tenant+"','"+firstUser+"','ACTIVE'),('"+target+"','"+tenant+"','"+targetUser+"','ACTIVE'),('"+managerMember+"','"+tenant+"','"+managerUser+"','ACTIVE')");
+                s.execute("INSERT INTO app_role(role_id,tenant_id,code,name) VALUES ('"+protectedRole+"','"+tenant+"','TENANT_ADMIN','Admin')");
+                s.execute("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES ('"+tenant+"','"+protectedRole+"','TENANT_READ'),('"+tenant+"','"+protectedRole+"','TENANT_MANAGE'),('"+tenant+"','"+protectedRole+"','USER_MANAGE')");
+                s.execute("INSERT INTO membership_role(tenant_id,membership_id,role_id) VALUES ('"+tenant+"','"+first+"','"+protectedRole+"'),('"+tenant+"','"+managerMember+"','"+protectedRole+"')");
+                c.commit();
+            }
+            String base="/test-only-platform-authorization/platform/"+tenant+"/";
+            given().post(base+target+"/designate").then().statusCode(401);
+            given().auth().oauth2("invalid-token").post(base+target+"/designate").then().statusCode(401);
+            given().auth().oauth2(unprovisioned).post(base+target+"/designate").then().statusCode(403);
+            given().auth().oauth2(manager).post(base+target+"/designate").then().statusCode(403);
+            given().auth().oauth2(manager).post(base+first+"/remove").then().statusCode(403);
+            given().auth().oauth2(otherClient).post(base+target+"/designate").then().statusCode(403);
+            given().auth().oauth2(otherClient).post(base+first+"/remove").then().statusCode(403);
+            try (var c=dataSource.getConnection(); var s=c.prepareStatement("UPDATE tenant_membership SET status='SUSPENDED' WHERE tenant_id=? AND membership_id=?")) {
+                s.setObject(1,tenant); s.setObject(2,managerMember); s.executeUpdate();
+            }
+            given().auth().oauth2(platform).post(base+target+"/designate").then().statusCode(204);
+            given().auth().oauth2(platform).post(base+first+"/remove").then().statusCode(204);
+            given().auth().oauth2(platform).post(base+target+"/remove").then().statusCode(409);
+            try(var c=dataSource.getConnection(); var s=c.prepareStatement("""
+                    SELECT (SELECT count(*) FROM membership_role WHERE tenant_id=? AND role_id=?),
+                           (SELECT count(*) FROM audit_event WHERE tenant_id=? AND actor_user_id=? AND action IN ('ROLE_ASSIGNED','ROLE_REVOKED'))
+                    """)) {
+                s.setObject(1,tenant); s.setObject(2,protectedRole); s.setObject(3,tenant); s.setObject(4,platformUser);
+                try(var rows=s.executeQuery()) { assertTrue(rows.next()); assertEquals(2,rows.getInt(1)); assertEquals(2,rows.getInt(2)); }
+            }
+        } finally {
+            try(var c=dataSource.getConnection(); var s=c.createStatement()) {
+                s.execute("DELETE FROM audit_event WHERE tenant_id='"+tenant+"'");
+                s.execute("DELETE FROM membership_role WHERE tenant_id='"+tenant+"'");
+                s.execute("DELETE FROM role_permission WHERE tenant_id='"+tenant+"' AND role_id IN (SELECT role_id FROM app_role WHERE tenant_id='"+tenant+"' AND code<>'TENANT_ADMIN')");
+                s.execute("DELETE FROM tenant_membership WHERE tenant_id='"+tenant+"'");
+                s.execute("DELETE FROM app_role WHERE tenant_id='"+tenant+"' AND code<>'TENANT_ADMIN'");
+            }
+        }
+    }
+
+    private UUID provision(String token) {
+        return UUID.fromString(given().auth().oauth2(token).get("/test-only-platform-authorization/account")
+                .then().statusCode(200).extract().asString());
+    }
+
+    @Test
     void onlyRoleOfConfiguredClientGrantsGlobalAuthority() {
         check(KeycloakRealmResource.ADMIN, 200);
         check(KeycloakRealmResource.MEMBER, 403);

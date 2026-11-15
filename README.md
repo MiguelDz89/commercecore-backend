@@ -39,7 +39,16 @@ OpenAPI está disponible en `/q/openapi`; Swagger UI está disponible por defect
 en desarrollo y pruebas en `/q/swagger-ui`. Los checks están en `/q/health`,
 `/q/health/live` y `/q/health/ready`.
 
-Ejecuta `mvnw.cmd test` en Windows o `./mvnw test` en Unix. El módulo Media
+Las pruebas de `@QuarkusTest` usan el perfil `test` y se ejecutan con
+`mvnw.cmd clean test` en Windows o `./mvnw clean test` en Unix. Para incluir
+las pruebas de la aplicación empaquetada (`@QuarkusIntegrationTest`), ejecuta
+`mvnw.cmd clean verify "-DskipITs=false"` en Windows o
+`./mvnw clean verify -DskipITs=false` en Unix. Failsafe también usa el perfil
+`test` para la aplicación empaquetada, sin cambiar el perfil de producción.
+Estas pruebas requieren Docker: Dev Services proporciona PostgreSQL temporal
+aislado, donde Flyway aplica las migraciones, y Keycloak para OIDC.
+
+El módulo Media
 incorporará AWS SDK for Java v2 (`software.amazon.awssdk:s3`, que incluye el
 presigner) y la importación Excel incorporará `org.apache.poi:poi-ooxml` cuando
 se implementen esas funcionalidades.
