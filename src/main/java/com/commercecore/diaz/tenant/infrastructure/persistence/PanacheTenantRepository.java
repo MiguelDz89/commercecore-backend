@@ -34,6 +34,14 @@ public class PanacheTenantRepository implements TenantRepository {
     }
 
     @Override
+    public Optional<TenantStatus> findCurrentStatus(UUID tenantId) {
+        return store.getEntityManager().createQuery(
+                "select t.status from TenantJpaEntity t where t.tenantId = :tenantId", TenantStatus.class)
+                .setHint("org.hibernate.cacheable", false)
+                .setParameter("tenantId", tenantId).getResultStream().findFirst();
+    }
+
+    @Override
     public Optional<Tenant> findBySlug(String slug) {
         return store.find("slug", slug).firstResultOptional().map(mapper::toDomain);
     }
