@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @QuarkusTest
 class TenantPersistenceTest {
     @Inject TenantRepository repository;
+    @Inject TenantPanacheStore store;
     @Inject TenantPersistenceMapper mapper;
     @Inject DataSource dataSource;
     @Inject EntityManager entityManager;
@@ -24,7 +25,7 @@ class TenantPersistenceTest {
     @TestTransaction
     void createsAndFindsByIdAndSlugWithAllFields() {
         Tenant tenant = Tenant.create(slug(), "Empresa Legal", "Empresa", "PEN", "America/Lima");
-        repository.create(tenant);
+        insertForPersistenceTest(tenant);
         assertEquals(tenant, repository.findByTenantId(tenant.tenantId()).orElseThrow());
         assertEquals(tenant, repository.findBySlug(tenant.slug()).orElseThrow());
         assertTrue(repository.findByTenantId(UUID.randomUUID()).isEmpty());
@@ -45,7 +46,7 @@ class TenantPersistenceTest {
     @TestTransaction
     void readsExistingDatabaseStatesAsEnum() {
         Tenant tenant = Tenant.create(slug(), "Legal", "Comercial", "PEN", "UTC");
-        repository.create(tenant);
+        insertForPersistenceTest(tenant);
         for (TenantStatus status : TenantStatus.values()) {
             entityManager.createNativeQuery("UPDATE tenant SET status = ?1 WHERE tenant_id = ?2")
                     .setParameter(1, status.name()).setParameter(2, tenant.tenantId()).executeUpdate();
@@ -58,9 +59,9 @@ class TenantPersistenceTest {
     @TestTransaction
     void databaseEnforcesUniqueSlug() {
         String slug = slug();
-        repository.create(Tenant.create(slug, "Legal uno", "Uno", "PEN", "UTC"));
+        insertForPersistenceTest(Tenant.create(slug, "Legal uno", "Uno", "PEN", "UTC"));
         RuntimeException failure = assertThrows(RuntimeException.class,
-                () -> repository.create(Tenant.create(slug, "Legal dos", "Dos", "PEN", "UTC")));
+                () -> insertForPersistenceTest(Tenant.create(slug, "Legal dos", "Dos", "PEN", "UTC")));
         assertTrue(hasSqlState(failure, "23505"), "PostgreSQL should report unique_violation");
     }
 
@@ -91,6 +92,10 @@ class TenantPersistenceTest {
             }
         }
         assertEquals(TenantStatus.ACTIVE, repository.findByTenantId(id).orElseThrow().status());
+    }
+
+    private void insertForPersistenceTest(Tenant tenant) {
+        store.persistAndFlush(mapper.toEntity(tenant));
     }
 
     private static String slug() {

@@ -39,6 +39,36 @@ class MembershipAdministrationPersistenceTest {
     record Fixture(UUID tenant, UUID admin, UUID adminMembership, UUID user, ActorId actor, ActorId invited) {}
 
     @Test @TestTransaction
+    void pagedRoleLoadingUsesOneQueryRegardlessOfPageSize() {
+        Fixture f=fixture();
+        for(int i=0;i<4;i++) {
+            UUID role=UUID.randomUUID();
+            execute("INSERT INTO app_role(role_id,tenant_id,code,name) VALUES (?,?,?,?)",role,f.tenant(),"batch-"+i,"Batch");
+            execute("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES (?,?,'PRODUCT_READ')",f.tenant(),role);
+        }
+        var count=new java.util.concurrent.atomic.AtomicInteger();
+        DataSource monitored=(DataSource)java.lang.reflect.Proxy.newProxyInstance(DataSource.class.getClassLoader(),new Class<?>[]{DataSource.class},
+            (proxy,method,args) -> {
+                try {
+                    Object value=method.invoke(db,args);
+                    if(method.getName().equals("getConnection")) {
+                        var connection=(java.sql.Connection)value;
+                        return java.lang.reflect.Proxy.newProxyInstance(java.sql.Connection.class.getClassLoader(),new Class<?>[]{java.sql.Connection.class},
+                            (cp,cm,ca) -> { try { if(cm.getName().equals("prepareStatement")) count.incrementAndGet(); return cm.invoke(connection,ca); }
+                                catch(java.lang.reflect.InvocationTargetException ex) { throw ex.getCause(); } });
+                    }
+                    return value;
+                } catch(java.lang.reflect.InvocationTargetException ex) { throw ex.getCause(); }
+            });
+        var jdbc=new JdbcTenantRoleStore(monitored);
+        var first=jdbc.listPage(f.tenant(),0,1); assertEquals(1,first.size()); assertEquals(1,count.get());
+        count.set(0);
+        var page=jdbc.listPage(f.tenant(),0,4); assertEquals(4,page.size()); assertEquals(1,count.get());
+        assertTrue(page.stream().allMatch(role -> role.permissions().contains("PRODUCT_READ")));
+        assertEquals(first.get(0),page.get(0));
+    }
+
+    @Test @TestTransaction
     void invitationAcceptanceSuspensionAndReactivationAreAuditedAndIsolated() {
         Fixture f = fixture(); var admin = service(f.actor(), audit, tenants);
         var invited = admin.invite(f.tenant(), f.user());

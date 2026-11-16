@@ -35,11 +35,21 @@ public class TenantRoleAdministrationService implements TenantRoleAdministration
     @Override @Transactional public List<TenantRole> roles(UUID tenant) {
         prepare(tenant, false, false); return roles.list(tenant);
     }
+    @Override @Transactional public List<TenantRole> roles(UUID tenant, int offset, int limit) {
+        pagination(offset,limit); prepare(tenant,false,false); return roles.listPage(tenant,offset,limit);
+    }
     @Override @Transactional public Set<String> permissions(UUID tenant, UUID role) {
         prepare(tenant, false, false); return requireRole(tenant, role).permissions();
     }
     @Override @Transactional public List<TenantRole> membershipRoles(UUID tenant, UUID member) {
         prepare(tenant, false, false); requireMember(tenant,member); return roles.listMembershipRoles(tenant,member);
+    }
+    @Override @Transactional public List<TenantRole> membershipRoles(UUID tenant, UUID member, int offset, int limit) {
+        pagination(offset,limit); prepare(tenant,false,false); requireMember(tenant,member);
+        return roles.listMembershipRolesPage(tenant,member,offset,limit);
+    }
+    private static void pagination(int offset, int limit) {
+        if (offset<0 || limit<1 || limit>100) throw new IllegalArgumentException("Invalid pagination");
     }
     @Override @Transactional public void assign(UUID tenant, UUID member, UUID role) {
         ordinaryAssignment(tenant,member,role,true);

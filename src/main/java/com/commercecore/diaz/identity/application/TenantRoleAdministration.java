@@ -7,8 +7,10 @@ import java.util.UUID;
 
 public interface TenantRoleAdministration {
     List<TenantRole> roles(UUID tenantId);
+    List<TenantRole> roles(UUID tenantId, int offset, int limit);
     Set<String> permissions(UUID tenantId, UUID roleId);
     List<TenantRole> membershipRoles(UUID tenantId, UUID membershipId);
+    List<TenantRole> membershipRoles(UUID tenantId, UUID membershipId, int offset, int limit);
     void assign(UUID tenantId, UUID membershipId, UUID roleId);
     void revoke(UUID tenantId, UUID membershipId, UUID roleId);
     void changePermissions(UUID tenantId, UUID roleId, Set<String> permissions);

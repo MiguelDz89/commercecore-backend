@@ -1,6 +1,7 @@
 package com.commercecore.diaz.tenant.infrastructure.persistence;
 
 import com.commercecore.diaz.tenant.application.port.TenantRepository;
+import com.commercecore.diaz.tenant.application.port.TenantCreationGuard;
 import com.commercecore.diaz.tenant.domain.Tenant;
 import com.commercecore.diaz.tenant.domain.TenantStatus;
 import io.quarkus.hibernate.orm.panache.PanacheRepositoryBase;
@@ -13,10 +14,12 @@ import java.util.UUID;
 public class PanacheTenantRepository implements TenantRepository {
     private final TenantPersistenceMapper mapper;
     private final TenantPanacheStore store;
+    private final TenantCreationGuard guard;
 
-    public PanacheTenantRepository(TenantPersistenceMapper mapper, TenantPanacheStore store) {
+    public PanacheTenantRepository(TenantPersistenceMapper mapper, TenantPanacheStore store, TenantCreationGuard guard) {
         this.mapper = mapper;
         this.store = store;
+        this.guard = guard;
     }
 
     @Override
@@ -25,6 +28,7 @@ public class PanacheTenantRepository implements TenantRepository {
         if (tenant.status() != TenantStatus.ACTIVE) {
             throw new IllegalArgumentException("A new tenant must be active");
         }
+        guard.requireStarted(tenant.tenantId());
         store.persistAndFlush(mapper.toEntity(tenant));
     }
 

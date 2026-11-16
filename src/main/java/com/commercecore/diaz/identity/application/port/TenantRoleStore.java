@@ -11,7 +11,9 @@ public interface TenantRoleStore {
     Optional<TenantRole> find(UUID tenantId, UUID roleId);
     Optional<TenantRole> findAdmin(UUID tenantId);
     List<TenantRole> list(UUID tenantId);
+    List<TenantRole> listPage(UUID tenantId, int offset, int limit);
     List<TenantRole> listMembershipRoles(UUID tenantId, UUID membershipId);
+    List<TenantRole> listMembershipRolesPage(UUID tenantId, UUID membershipId, int offset, int limit);
     boolean roleAssignedToUser(UUID tenantId, UUID roleId, UUID userId);
     boolean roleAssignedToAdmin(UUID tenantId, UUID roleId);
     boolean hasAssignment(UUID tenantId, UUID membershipId, UUID roleId);

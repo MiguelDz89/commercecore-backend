@@ -10,7 +10,8 @@ public record TenantAuditEvent(UUID tenantId, UUID actorUserId, EntityType entit
                                Set<String> previousPermissions, Set<String> newPermissions) {
     public enum EntityType { TENANT, MEMBERSHIP, ROLE }
     public enum Action { MEMBERSHIP_INVITED, MEMBERSHIP_ACTIVATED, MEMBERSHIP_SUSPENDED,
-        MEMBERSHIP_REACTIVATED, ROLE_ASSIGNED, ROLE_REVOKED, ROLE_PERMISSIONS_CHANGED }
+        MEMBERSHIP_REACTIVATED, ROLE_ASSIGNED, ROLE_REVOKED, ROLE_PERMISSIONS_CHANGED,
+        TENANT_CREATED, MEMBERSHIP_BOOTSTRAPPED, ROLE_CREATED }
 
     public TenantAuditEvent {
         Objects.requireNonNull(tenantId, "tenantId");

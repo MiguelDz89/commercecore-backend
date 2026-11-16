@@ -1,10 +1,10 @@
 package com.commercecore.diaz.identity.infrastructure.persistence;
 
 import com.commercecore.diaz.identity.application.port.TenantRoleStore;
+import com.commercecore.diaz.identity.application.AuthorizationIntegrityException;
 import com.commercecore.diaz.identity.domain.TenantRole;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.transaction.Transactional;
-import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -29,6 +29,16 @@ public class JdbcTenantRoleStore implements TenantRoleStore {
     @Override public List<TenantRole> list(UUID tenant) {
         return roles("SELECT role_id,code FROM app_role WHERE tenant_id=? ORDER BY code,role_id", tenant);
     }
+    @Override public List<TenantRole> listPage(UUID tenant, int offset, int limit) {
+        return roles("SELECT role_id,code FROM app_role WHERE tenant_id=? ORDER BY code,role_id LIMIT ? OFFSET ?",tenant,limit,offset);
+    }
+    @Override public List<TenantRole> listMembershipRolesPage(UUID tenant, UUID membership, int offset, int limit) {
+        return roles("""
+                SELECT r.role_id,r.code FROM app_role r JOIN membership_role mr
+                ON r.tenant_id=mr.tenant_id AND r.role_id=mr.role_id
+                WHERE r.tenant_id=? AND mr.membership_id=? ORDER BY r.code,r.role_id LIMIT ? OFFSET ?
+                """,tenant,membership,limit,offset);
+    }
     @Override public List<TenantRole> listMembershipRoles(UUID tenant, UUID membership) {
         return roles("""
                 SELECT r.role_id,r.code FROM app_role r JOIN membership_role mr
@@ -37,23 +47,28 @@ public class JdbcTenantRoleStore implements TenantRoleStore {
                 """, tenant, membership);
     }
     private List<TenantRole> roles(String sql, UUID tenant, Object... args) {
-        try (var c = dataSource.getConnection(); var s = c.prepareStatement(sql)) {
-            s.setObject(1, tenant); for (int i=0; i<args.length; i++) s.setObject(i+2,args[i]);
-            var result = new ArrayList<TenantRole>();
-            try (var rows = s.executeQuery()) {
-                while (rows.next()) {
-                    UUID id = rows.getObject(1, UUID.class);
-                    result.add(new TenantRole(tenant, id, rows.getString(2), permissions(c, tenant, id)));
+        // The page is selected before joining permissions, preserving LIMIT/OFFSET semantics.
+        String grouped = "SELECT page.role_id,page.code, "
+                + "array_agg(p.permission_code ORDER BY p.permission_code) FILTER (WHERE p.permission_code IS NOT NULL) "
+                + "FROM ("+sql+") page LEFT JOIN role_permission p ON p.tenant_id=? AND p.role_id=page.role_id "
+                + "GROUP BY page.role_id,page.code ORDER BY page.code,page.role_id";
+        try (var c=dataSource.getConnection(); var s=c.prepareStatement(grouped)) {
+            s.setObject(1,tenant);
+            for (int i=0;i<args.length;i++) s.setObject(i+2,args[i]);
+            s.setObject(args.length+2,tenant);
+            var result=new ArrayList<TenantRole>();
+            try (var rows=s.executeQuery()) {
+                while(rows.next()) {
+                    var permissions=new HashSet<String>();
+                    var array=rows.getArray(3);
+                    if(array!=null) { try { for(Object value:(Object[])array.getArray()) permissions.add((String)value); }
+                        finally { array.free(); } }
+                    try { result.add(new TenantRole(tenant,rows.getObject(1,UUID.class),rows.getString(2),permissions)); }
+                    catch(IllegalArgumentException e) { throw new AuthorizationIntegrityException("Inconsistent persisted tenant role"); }
                 }
             }
             return List.copyOf(result);
-        } catch (SQLException e) { throw failure(e); }
-    }
-    private Set<String> permissions(Connection c, UUID tenant, UUID role) throws SQLException {
-        try (var s = c.prepareStatement("SELECT permission_code FROM role_permission WHERE tenant_id=? AND role_id=?")) {
-            s.setObject(1,tenant); s.setObject(2,role);
-            try (var r=s.executeQuery()) { var set=new HashSet<String>(); while(r.next()) set.add(r.getString(1)); return set; }
-        }
+        } catch(SQLException e) { throw failure(e); }
     }
     @Override public boolean roleAssignedToUser(UUID tenant, UUID role, UUID user) {
         return exists("""

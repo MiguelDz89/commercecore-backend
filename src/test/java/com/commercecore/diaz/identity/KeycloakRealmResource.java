@@ -17,6 +17,7 @@ public class KeycloakRealmResource implements QuarkusTestResourceLifecycleManage
     static final String TENANT = "u" + UUID.randomUUID().toString().replace("-", "");
     static final String OTHER = "u" + UUID.randomUUID().toString().replace("-", "");
     static final String UNPROVISIONED = "u" + UUID.randomUUID().toString().replace("-", "");
+    static final String ONBOARD_TARGET = "u" + UUID.randomUUID().toString().replace("-", "");
     static final String PASSWORD = UUID.randomUUID() + "-" + UUID.randomUUID();
     private Path realmFile;
     private Path foreignRealmFile;
@@ -36,14 +37,19 @@ public class KeycloakRealmResource implements QuarkusTestResourceLifecycleManage
                     "protocolMappers":[{"name":"api-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper",
                        "config":{"included.client.audience":"commercecore-api","access.token.claim":"true","id.token.claim":"false"}}]},
                    {"clientId":"other-client","enabled":true,"publicClient":true,"directAccessGrantsEnabled":true,
-                    "fullScopeAllowed":true,"protocol":"openid-connect"}],
+                    "fullScopeAllowed":true,"protocol":"openid-connect"},
+                   {"clientId":"short-lived","enabled":true,"publicClient":true,"directAccessGrantsEnabled":true,
+                    "fullScopeAllowed":true,"protocol":"openid-connect","attributes":{"access.token.lifespan":"3"},
+                    "protocolMappers":[{"name":"api-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper",
+                       "config":{"included.client.audience":"commercecore-api","access.token.claim":"true","id.token.claim":"false"}}]}],
                  "users":[
                    {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"admin@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}],"clientRoles":{"commercecore-api":["PLATFORM_SUPER_ADMIN"]}},
                    {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"member@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}]},
                    {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"tenant@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}],"clientRoles":{"commercecore-api":["TENANT_MANAGE"]}},
                    {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"other@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}],"clientRoles":{"other-client":["PLATFORM_SUPER_ADMIN"]}},
-                   {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"unprovisioned@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}],"clientRoles":{"commercecore-api":["PLATFORM_SUPER_ADMIN"]}}]}
-                """.formatted(ADMIN, PASSWORD, MEMBER, PASSWORD, TENANT, PASSWORD, OTHER, PASSWORD, UNPROVISIONED, PASSWORD);
+                   {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"unprovisioned@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}],"clientRoles":{"commercecore-api":["PLATFORM_SUPER_ADMIN"]}},
+                   {"username":"%s","enabled":true,"emailVerified":true,"firstName":"Test","lastName":"User","email":"onboarding@example.invalid","credentials":[{"type":"password","temporary":false,"value":"%s"}]}]}
+                """.formatted(ADMIN, PASSWORD, MEMBER, PASSWORD, TENANT, PASSWORD, OTHER, PASSWORD, UNPROVISIONED, PASSWORD, ONBOARD_TARGET, PASSWORD);
             Files.writeString(realmFile, realm);
             foreignRealmFile = Files.createTempFile("commercecore-foreign-realm-", ".json");
             Files.writeString(foreignRealmFile, realm.replace("\"realm\":\"commercecore-test\"", "\"realm\":\"foreign-test\""));

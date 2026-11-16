@@ -21,7 +21,7 @@ class RbacV4MigrationTest {
         try(var pg=new GenericContainer<>(DockerImageName.parse("postgres:18"))
                 .withEnv("POSTGRES_USER","commercecore_test").withEnv("POSTGRES_PASSWORD",password)
                 .withEnv("POSTGRES_DB","commercecore_test").withExposedPorts(5432)
-                .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(2)))) {
+                .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\s",2).withStartupTimeout(Duration.ofMinutes(2)))) {
             pg.start();
             String url="jdbc:postgresql://"+pg.getHost()+":"+pg.getMappedPort(5432)+"/commercecore_test";
             Flyway.configure().dataSource(url,"commercecore_test",password).target("3").load().migrate();
@@ -45,7 +45,7 @@ class RbacV4MigrationTest {
         try(var pg=new GenericContainer<>(DockerImageName.parse("postgres:18"))
                 .withEnv("POSTGRES_USER","commercecore_test").withEnv("POSTGRES_PASSWORD",password)
                 .withEnv("POSTGRES_DB","commercecore_test").withExposedPorts(5432)
-                .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(2)))) {
+                .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\s",2).withStartupTimeout(Duration.ofMinutes(2)))) {
             pg.start();
             String url="jdbc:postgresql://"+pg.getHost()+":"+pg.getMappedPort(5432)+"/commercecore_test";
             Flyway.configure().dataSource(url,"commercecore_test",password).target("3").load().migrate();
