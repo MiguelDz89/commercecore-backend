@@ -31,7 +31,7 @@ class RbacV4MigrationTest {
                 s.execute("INSERT INTO app_role(tenant_id,role_id,code,name) VALUES ('"+tenant+"','"+role+"','ordinary','Ordinary')");
                 s.execute("INSERT INTO role_permission(tenant_id,role_id,permission_code) VALUES ('"+tenant+"','"+role+"','PRODUCT_READ')");
             }
-            assertEquals(1,Flyway.configure().dataSource(url,"commercecore_test",password).load().migrate().migrationsExecuted);
+            assertEquals(1,Flyway.configure().dataSource(url,"commercecore_test",password).target("4").load().migrate().migrationsExecuted);
             try(var c=DriverManager.getConnection(url,"commercecore_test",password); var s=c.createStatement()) {
                 try(var r=s.executeQuery("SELECT count(*) FROM flyway_schema_history WHERE version='4' AND success")) { assertTrue(r.next()); assertEquals(1,r.getInt(1)); }
                 try(var r=s.executeQuery("SELECT count(*) FROM role_permission WHERE role_id='"+role+"' AND permission_code='PRODUCT_READ'")) { assertTrue(r.next()); assertEquals(1,r.getInt(1)); }
@@ -61,7 +61,7 @@ class RbacV4MigrationTest {
             var ds=new PGSimpleDataSource(); ds.setURL(url); ds.setUser("commercecore_test"); ds.setPassword(password);
             assertThrows(AuthorizationIntegrityException.class, () -> new JdbcTenantPermissionLookup(ds)
                     .hasPermission(new ActorId("https://issuer.test","historical"),tenant,"USER_MANAGE"));
-            FlywayException failure=assertThrows(FlywayException.class,() -> Flyway.configure().dataSource(url,"commercecore_test",password).load().migrate());
+            FlywayException failure=assertThrows(FlywayException.class,() -> Flyway.configure().dataSource(url,"commercecore_test",password).target("4").load().migrate());
             assertTrue(failure.getMessage().contains("RBAC integrity"));
             try(var c=DriverManager.getConnection(url,"commercecore_test",password); var s=c.createStatement()) {
                 try(var r=s.executeQuery("SELECT count(*) FROM role_permission WHERE role_id='"+role+"' AND permission_code='USER_MANAGE'")) { assertTrue(r.next()); assertEquals(1,r.getInt(1)); }

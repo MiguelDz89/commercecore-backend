@@ -351,6 +351,18 @@ class OidcPlatformAuthorizationTest {
         String platform="/api/v1/platform/tenants/{tenantId}/administrators/{membershipId}";
         assertTrue(document.path("paths").path(platform).has("put"));
         assertTrue(document.path("paths").path(platform).has("delete"));
+        String categories="/api/v1/tenants/{tenantId}/categories";
+        assertTrue(document.path("paths").path(categories).has("get"));
+        assertTrue(document.path("paths").path(categories).has("post"));
+        assertTrue(document.path("paths").path(categories+"/{categoryId}").has("get"));
+        assertTrue(document.path("paths").path(categories+"/{categoryId}").has("patch"));
+        assertTrue(document.path("paths").path(categories+"/{categoryId}/deactivation").has("post"));
+        assertTrue(document.path("paths").path(categories+"/{categoryId}/reactivation").has("post"));
+        String products="/api/v1/tenants/{tenantId}/products";
+        assertTrue(document.path("paths").path(products).has("get"));
+        assertTrue(document.path("paths").path(products).has("post"));
+        assertTrue(document.path("paths").path(products+"/{productId}").has("get"));
+        assertTrue(document.path("paths").path(products+"/{productId}").has("patch"));
     }
 
     @Test
@@ -521,6 +533,216 @@ class OidcPlatformAuthorizationTest {
             assertEquals(java.util.Set.of(204,409),java.util.Set.of(first.get(),second.get()));
         } finally { pool.shutdownNow(); }
         assertEquals(1,sqlCount("SELECT count(*) FROM membership_role mr JOIN app_role r ON r.tenant_id=mr.tenant_id AND r.role_id=mr.role_id WHERE mr.tenant_id=? AND r.code='TENANT_ADMIN'",tenant));
+    }
+
+    @Test
+    void categoriesHttpSecurityHierarchyConcurrencyAndAudit() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        String reader=token(KeycloakRealmResource.OTHER,"commercecore-api");
+        UUID adminId=provision(admin), readerId=provision(reader);
+        String prefix="categories-"+UUID.randomUUID();
+        var createTenant=java.util.Map.of("slug",prefix,"legalName","Empresa","displayName","Empresa","currencyCode","PEN",
+                "timeZone","UTC","initialAdministratorAccountId",adminId.toString(),"commercialProfiles",java.util.List.of("CATALOG_MANAGER"));
+        String tenant=given().auth().oauth2(admin).contentType("application/json").body(createTenant).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        var second=new java.util.HashMap<>(createTenant); second.put("slug","categories-other-"+UUID.randomUUID());
+        second.put("initialAdministratorAccountId",readerId.toString()); second.put("commercialProfiles",java.util.List.of("CATALOG_VIEWER"));
+        String other=given().auth().oauth2(admin).contentType("application/json").body(second).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        String base="/api/v1/tenants/"+tenant+"/categories", otherBase="/api/v1/tenants/"+other+"/categories";
+        given().get(base).then().statusCode(401);
+        given().auth().oauth2("invalid").get(base).then().statusCode(401).contentType("application/problem+json");
+        given().auth().oauth2(reader).get(base).then().statusCode(404);
+        given().auth().oauth2(admin).get(otherBase).then().statusCode(404);
+        given().auth().oauth2(reader).get(otherBase).then().statusCode(200);
+        given().auth().oauth2(reader).contentType("application/json").body(java.util.Map.of("code","NO","name","No"))
+                .post(otherBase).then().statusCode(404);
+        String root=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","A","name","Raiz"))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","A","name","Duplicado"))
+                .post(base).then().statusCode(409);
+        String otherRoot=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","B","name","Otra"))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        String child=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","C","name","Hija","parentCategoryId",root))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        given().auth().oauth2(admin).queryParam("search","hij").queryParam("limit",1).get(base).then().statusCode(200).body("items.size()",is(1));
+        given().auth().oauth2(admin).get(base+"/"+child).then().statusCode(200).body("parentCategoryId",is(root));
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("name","Hija editada","description","detalle"))
+                .patch(base+"/"+child).then().statusCode(200).body("name",is("Hija editada"));
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","NEW"))
+                .patch(base+"/"+child).then().statusCode(400);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("parentCategoryId",root))
+                .patch(base+"/"+root).then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("parentCategoryId",child))
+                .patch(base+"/"+root).then().statusCode(409);
+        given().auth().oauth2(admin).post(base+"/"+root+"/deactivation").then().statusCode(409);
+        given().auth().oauth2(admin).post(base+"/"+child+"/deactivation").then().statusCode(200).body("status",is("INACTIVE"));
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","D","name","No","parentCategoryId",child))
+                .post(base).then().statusCode(409);
+        given().auth().oauth2(admin).post(base+"/"+child+"/reactivation").then().statusCode(200).body("status",is("ACTIVE"));
+        UUID foreign=UUID.randomUUID();
+        try(var c=dataSource.getConnection();var q=c.prepareStatement("INSERT INTO category(category_id,tenant_id,code,name) VALUES (?,?,?,?)")) {
+            q.setObject(1,foreign);q.setObject(2,UUID.fromString(other));q.setString(3,"FOREIGN");q.setString(4,"Foreign");q.executeUpdate();
+        }
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("parentCategoryId",foreign.toString()))
+                .patch(base+"/"+root).then().statusCode(404);
+        var latch=new java.util.concurrent.CountDownLatch(1); var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<Integer> first=() -> { latch.await();return given().auth().oauth2(admin).contentType("application/json")
+                    .body(java.util.Map.of("parentCategoryId",otherRoot)).patch(base+"/"+root).statusCode(); };
+            java.util.concurrent.Callable<Integer> secondMove=() -> { latch.await();return given().auth().oauth2(admin).contentType("application/json")
+                    .body(java.util.Map.of("parentCategoryId",root)).patch(base+"/"+otherRoot).statusCode(); };
+            var one=pool.submit(first);var two=pool.submit(secondMove);latch.countDown();
+            assertEquals(java.util.Set.of(200,409),java.util.Set.of(one.get(),two.get()));
+        } finally {pool.shutdownNow();}
+        String suffix=UUID.randomUUID().toString().replace("-","");String function="category_fail_"+suffix,trigger="category_trigger_"+suffix;
+        try {
+            try(var c=dataSource.getConnection();var st=c.createStatement()) {
+                st.execute("CREATE FUNCTION "+function+"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.tenant_id='"+tenant+"' AND NEW.entity_type='CATEGORY' THEN RAISE EXCEPTION 'audit unavailable'; END IF; RETURN NEW; END $$");
+                st.execute("CREATE TRIGGER "+trigger+" BEFORE INSERT ON audit_event FOR EACH ROW EXECUTE FUNCTION "+function+"()");
+            }
+            var failure=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("name","No persistir"))
+                    .patch(base+"/"+child); failure.then().statusCode(500);
+            assertFalse(failure.asString().contains("audit unavailable"));
+            given().auth().oauth2(admin).get(base+"/"+child).then().statusCode(200).body("name",is("Hija editada"));
+        } finally {try(var c=dataSource.getConnection();var st=c.createStatement()) {
+            st.execute("DROP TRIGGER IF EXISTS "+trigger+" ON audit_event");st.execute("DROP FUNCTION IF EXISTS "+function+"()");
+        }}
+        assertTrue(sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_type='CATEGORY' AND before_data IS NOT NULL AND after_data IS NOT NULL",UUID.fromString(tenant))>0);
+        try(var c=dataSource.getConnection();var q=c.prepareStatement("UPDATE tenant SET status='SUSPENDED' WHERE tenant_id=?")) {q.setObject(1,UUID.fromString(tenant));q.executeUpdate();}
+        given().auth().oauth2(admin).get(base).then().statusCode(404);
+    }
+
+    @Test
+    void categoryReactivationRequiresActiveParentAndSerializesWithDeactivation() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        UUID account=provision(admin);
+        var body=java.util.Map.of("slug","category-state-"+UUID.randomUUID(),"legalName","Legal","displayName","Empresa",
+                "currencyCode","PEN","timeZone","UTC","initialAdministratorAccountId",account.toString(),"commercialProfiles",java.util.List.of("CATALOG_MANAGER"));
+        String tenant=given().auth().oauth2(admin).contentType("application/json").body(body)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        String base="/api/v1/tenants/"+tenant+"/categories";
+        String parent=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","P","name","Padre"))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        String child=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","C","name","Hija","parentCategoryId",parent))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        String other=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","O","name","Otra"))
+                .post(base).then().statusCode(201).extract().path("categoryId");
+        given().auth().oauth2(admin).post(base+"/"+parent+"/deactivation").then().statusCode(409);
+        given().auth().oauth2(admin).post(base+"/"+child+"/deactivation").then().statusCode(200);
+        given().auth().oauth2(admin).post(base+"/"+child+"/reactivation").then().statusCode(200).body("status",is("ACTIVE"));
+        given().auth().oauth2(admin).post(base+"/"+child+"/deactivation").then().statusCode(200);
+        given().auth().oauth2(admin).post(base+"/"+parent+"/deactivation").then().statusCode(200);
+        UUID tenantId=UUID.fromString(tenant),childId=UUID.fromString(child),otherId=UUID.fromString(other);
+        int auditBefore=sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_type='CATEGORY'",tenantId);
+        var childBefore=categoryUpdatedAt(tenantId,childId); var otherBefore=categoryUpdatedAt(tenantId,otherId);
+        given().auth().oauth2(admin).post(base+"/"+child+"/reactivation").then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("parentCategoryId",parent))
+                .patch(base+"/"+other).then().statusCode(409);
+        assertEquals(auditBefore,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_type='CATEGORY'",tenantId));
+        assertEquals(childBefore,categoryUpdatedAt(tenantId,childId)); assertEquals(otherBefore,categoryUpdatedAt(tenantId,otherId));
+        assertEquals(1,sqlCount("SELECT count(*) FROM category WHERE tenant_id=? AND category_id=? AND status='INACTIVE'",tenantId,childId));
+        assertEquals(1,sqlCount("SELECT count(*) FROM category WHERE tenant_id=? AND category_id=? AND status='ACTIVE' AND parent_category_id IS NULL",tenantId,otherId));
+        given().auth().oauth2(admin).post(base+"/"+parent+"/reactivation").then().statusCode(200).body("status",is("ACTIVE"));
+        int beforeRace=sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_type='CATEGORY'",tenantId);
+        var latch=new java.util.concurrent.CountDownLatch(1);var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<Integer> deactivate=() -> {latch.await();return given().auth().oauth2(admin).post(base+"/"+parent+"/deactivation").statusCode();};
+            java.util.concurrent.Callable<Integer> reactivate=() -> {latch.await();return given().auth().oauth2(admin).post(base+"/"+child+"/reactivation").statusCode();};
+            var one=pool.submit(deactivate);var two=pool.submit(reactivate);latch.countDown();
+            assertEquals(java.util.Set.of(200,409),java.util.Set.of(one.get(),two.get()));
+        } finally { pool.shutdownNow(); }
+        assertEquals(beforeRace+1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_type='CATEGORY'",tenantId));
+        assertEquals(0,sqlCount("SELECT count(*) FROM category c JOIN category p ON p.tenant_id=c.tenant_id AND p.category_id=c.parent_category_id WHERE c.tenant_id=? AND c.category_id=? AND c.status='ACTIVE' AND p.status='INACTIVE'",tenantId,childId));
+    }
+
+    private java.time.OffsetDateTime categoryUpdatedAt(UUID tenant,UUID category) throws Exception {
+        try(var c=dataSource.getConnection(); var q=c.prepareStatement("SELECT updated_at FROM category WHERE tenant_id=? AND category_id=?")) {
+            q.setObject(1,tenant);q.setObject(2,category);
+            try(var rows=q.executeQuery()) { assertTrue(rows.next());return rows.getObject(1,java.time.OffsetDateTime.class); }
+        }
+    }
+
+    @Test
+    void simpleProductsHttpOptimisticLockAndTenantIsolation() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        String outsider=token(KeycloakRealmResource.OTHER,"commercecore-api");
+        UUID account=provision(admin), outsiderAccount=provision(outsider);
+        var setup=java.util.Map.of("slug","products-"+UUID.randomUUID(),"legalName","Legal","displayName","Empresa",
+                "currencyCode","PEN","timeZone","UTC","initialAdministratorAccountId",account.toString(),"commercialProfiles",java.util.List.of("CATALOG_MANAGER","CATALOG_VIEWER"));
+        String tenant=given().auth().oauth2(admin).contentType("application/json").body(setup).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        var setup2=new java.util.HashMap<>(setup);setup2.put("slug","products-other-"+UUID.randomUUID());
+        String tenant2=given().auth().oauth2(admin).contentType("application/json").body(setup2).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        String categories="/api/v1/tenants/"+tenant+"/categories",categories2="/api/v1/tenants/"+tenant2+"/categories";
+        String category=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","A","name","Activa")).post(categories).then().statusCode(201).extract().path("categoryId");
+        String inactive=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","I","name","Inactiva")).post(categories).then().statusCode(201).extract().path("categoryId");
+        String foreign=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","F","name","Ajena")).post(categories2).then().statusCode(201).extract().path("categoryId");
+        given().auth().oauth2(admin).post(categories+"/"+inactive+"/deactivation").then().statusCode(200);
+        String base="/api/v1/tenants/"+tenant+"/products",base2="/api/v1/tenants/"+tenant2+"/products";
+        given().get(base).then().statusCode(401);given().auth().oauth2("invalid").get(base).then().statusCode(401);
+        given().auth().oauth2(outsider).get(base).then().statusCode(404);
+        var product=java.util.Map.of("categoryId",category,"sku","sku-abc","name","Filtro","description","Inicial");
+        var created=given().auth().oauth2(admin).contentType("application/json").body(product).post(base);
+        created.then().statusCode(201).body("status",is("DRAFT")).body("version",is(0));
+        assertFalse(created.asString().contains("salePrice"));String id=created.jsonPath().getString("productId");
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",category,"sku","  SKU-ABC  ","name","Otro")).post(base).then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",foreign,"sku","SKU-ABC","name","Otro tenant")).post(base2).then().statusCode(201);
+        for(String bad:java.util.List.of(foreign,UUID.randomUUID().toString()))
+            given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",bad,"sku",UUID.randomUUID().toString(),"name","No" )).post(base).then().statusCode(404);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",inactive,"sku","NO-ACTIVO","name","No")).post(base).then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",category,"sku","PRICE","name","No","salePrice",1)).post(base).then().statusCode(400);
+        given().auth().oauth2(admin).queryParam("sku"," SKU-AB ").queryParam("name","filt").queryParam("categoryId",category).queryParam("status","DRAFT").queryParam("limit",1)
+                .get(base).then().statusCode(200).body("items.size()",is(1));
+        given().auth().oauth2(admin).get(base+"/"+id).then().statusCode(200).body("sku",is("sku-abc"));
+        String member=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("accountId",outsiderAccount.toString()))
+                .post("/api/v1/tenants/"+tenant+"/memberships").then().statusCode(201).extract().path("membershipId");
+        given().auth().oauth2(outsider).post("/api/v1/tenants/"+tenant+"/memberships/"+member+"/acceptance").then().statusCode(200);
+        UUID viewer;
+        try(var c=dataSource.getConnection();var q=c.prepareStatement("SELECT role_id FROM app_role WHERE tenant_id=? AND code='CATALOG_VIEWER'")){
+            q.setObject(1,UUID.fromString(tenant));try(var rows=q.executeQuery()){assertTrue(rows.next());viewer=rows.getObject(1,UUID.class);}
+        }
+        given().auth().oauth2(admin).put("/api/v1/tenants/"+tenant+"/memberships/"+member+"/roles/"+viewer).then().statusCode(204);
+        given().auth().oauth2(outsider).get(base+"/"+id).then().statusCode(200);
+        given().auth().oauth2(outsider).contentType("application/json").body(java.util.Map.of("version",0,"name","No"))
+                .patch(base+"/"+id).then().statusCode(404);
+        given().auth().oauth2(outsider).contentType("application/json").body(java.util.Map.of("categoryId",category,"sku","NO-PERM","name","No"))
+                .post(base).then().statusCode(404);
+        given().auth().oauth2(admin).get(base2+"/"+id).then().statusCode(404);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",0,"sku","NEW")).patch(base+"/"+id).then().statusCode(400);
+        var start=new java.util.concurrent.CountDownLatch(1);var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<Integer> a=() -> {start.await();return given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",0,"name","Primero")).patch(base+"/"+id).statusCode();};
+            java.util.concurrent.Callable<Integer> b=() -> {start.await();return given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",0,"name","Segundo")).patch(base+"/"+id).statusCode();};
+            var one=pool.submit(a);var two=pool.submit(b);start.countDown();assertEquals(java.util.Set.of(200,409),java.util.Set.of(one.get(),two.get()));
+        } finally {pool.shutdownNow();}
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",0,"name","Obsoleto")).patch(base+"/"+id).then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"categoryId",inactive)).patch(base+"/"+id).then().statusCode(409);
+        UUID tenantId=UUID.fromString(tenant),productId=UUID.fromString(id);
+        assertEquals(1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_UPDATED'",tenantId,productId));
+        String suffix=UUID.randomUUID().toString().replace("-","");String function="product_fail_"+suffix,trigger="product_trigger_"+suffix;
+        try {
+            try(var c=dataSource.getConnection();var st=c.createStatement()){
+                st.execute("CREATE FUNCTION "+function+"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.tenant_id='"+tenant+"' AND NEW.entity_type='PRODUCT' THEN RAISE EXCEPTION 'audit failure'; END IF; RETURN NEW; END $$");
+                st.execute("CREATE TRIGGER "+trigger+" BEFORE INSERT ON audit_event FOR EACH ROW EXECUTE FUNCTION "+function+"()");
+            }
+            given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"name","No persistir")).patch(base+"/"+id).then().statusCode(500);
+            assertEquals(1,sqlCount("SELECT count(*) FROM product WHERE tenant_id=? AND product_id=? AND version=1 AND name<>'No persistir'",tenantId,productId));
+        } finally {try(var c=dataSource.getConnection();var st=c.createStatement()){
+            st.execute("DROP TRIGGER IF EXISTS "+trigger+" ON audit_event");st.execute("DROP FUNCTION IF EXISTS "+function+"()");
+        }}
+        String raceCategory=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","RACE","name","Carrera"))
+                .post(categories).then().statusCode(201).extract().path("categoryId");
+        var gate=new java.util.concurrent.CountDownLatch(1);var concurrent=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<Integer> make=() -> {gate.await();return given().auth().oauth2(admin).contentType("application/json")
+                    .body(java.util.Map.of("categoryId",raceCategory,"sku","RACE-SKU","name","Carrera")).post(base).statusCode();};
+            java.util.concurrent.Callable<Integer> disable=() -> {gate.await();return given().auth().oauth2(admin).post(categories+"/"+raceCategory+"/deactivation").statusCode();};
+            var productResult=concurrent.submit(make);var categoryResult=concurrent.submit(disable);gate.countDown();
+            int result=productResult.get();assertTrue(result==201 || result==409);assertEquals(200,categoryResult.get());
+            assertEquals(result==201?1:0,sqlCount("SELECT count(*) FROM product WHERE tenant_id=? AND sku_normalized='RACE-SKU'",tenantId));
+        } finally {concurrent.shutdownNow();}
+        try(var c=dataSource.getConnection();var q=c.prepareStatement("UPDATE product SET status='ARCHIVED' WHERE tenant_id=? AND product_id=?")){q.setObject(1,tenantId);q.setObject(2,productId);q.executeUpdate();}
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"name","Archivado")).patch(base+"/"+id).then().statusCode(409);
+        try(var c=dataSource.getConnection();var q=c.prepareStatement("UPDATE tenant SET status='SUSPENDED' WHERE tenant_id=?")){q.setObject(1,tenantId);q.executeUpdate();}
+        given().auth().oauth2(admin).get(base).then().statusCode(404);
     }
 
     @Test

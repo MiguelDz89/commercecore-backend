@@ -2,6 +2,8 @@ package com.commercecore.diaz.platform.http.error;
 
 import com.commercecore.diaz.tenant.application.DuplicateTenantSlugException;
 import com.commercecore.diaz.identity.application.MembershipConflictException;
+import com.commercecore.diaz.catalog.application.CategoryConflictException;
+import com.commercecore.diaz.catalog.application.ProductConflictException;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Context;
@@ -35,12 +37,12 @@ public class ProblemExceptionMapper implements ExceptionMapper<Exception> {
         return Response.status(status).type("application/problem+json").entity(problem).build();
     }
     private boolean isMembershipRequest() {
-        return uri!=null && uri.getPath().matches("/?api/v1/tenants/[^/]+/(?:memberships|roles)(?:/.*)?");
+        return uri!=null && uri.getPath().matches("/?api/v1/tenants/[^/]+/(?:memberships|roles|categories|products)(?:/.*)?");
     }
     private int classify(Throwable error) {
         Set<Throwable> seen=Collections.newSetFromMap(new IdentityHashMap<>());
         for(Throwable e=error; e!=null && seen.add(e); e=e.getCause()) {
-            if(e instanceof DuplicateTenantSlugException || e instanceof MembershipConflictException) return 409;
+            if(e instanceof DuplicateTenantSlugException || e instanceof MembershipConflictException || e instanceof CategoryConflictException || e instanceof ProductConflictException) return 409;
             if(e instanceof SecurityException) return isMembershipRequest() ? 404 : 403;
             if(e instanceof ConstraintViolationException || e instanceof IllegalArgumentException) return 400;
             if(e instanceof SQLTransientConnectionException || e instanceof SQLRecoverableException) return 503;

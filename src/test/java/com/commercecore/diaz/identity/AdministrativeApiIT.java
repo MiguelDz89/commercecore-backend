@@ -13,6 +13,10 @@ class AdministrativeApiIT {
                 .header("WWW-Authenticate",containsString("Bearer"));
         given().get("/api/v1/tenants/00000000-0000-4000-8000-000000000001/memberships").then().statusCode(401)
                 .header("WWW-Authenticate",containsString("Bearer"));
+        given().get("/api/v1/tenants/00000000-0000-4000-8000-000000000001/products").then().statusCode(401)
+                .header("WWW-Authenticate",containsString("Bearer"));
+        given().get("/api/v1/tenants/00000000-0000-4000-8000-000000000001/categories").then().statusCode(401)
+                .header("WWW-Authenticate",containsString("Bearer"));
         given().get("/api/v1/tenants/00000000-0000-4000-8000-000000000001/roles").then().statusCode(401)
                 .header("WWW-Authenticate",containsString("Bearer"));
         given().put("/api/v1/platform/tenants/00000000-0000-4000-8000-000000000001/administrators/00000000-0000-4000-8000-000000000002")

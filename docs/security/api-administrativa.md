@@ -102,3 +102,20 @@ en desarrollo. No guardar access tokens ni contraseñas en el repositorio.
 
 La demostración no cubre creación pública de roles, catálogo comercial,
 suspensión de empresas ni auditoría global; siguen fuera del alcance actual.
+
+## Categorías
+
+`GET` y `POST /api/v1/tenants/{tenantId}/categories`, `GET` y `PATCH
+/api/v1/tenants/{tenantId}/categories/{categoryId}`, y los `POST` de
+`deactivation` y `reactivation` administran categorías. La lectura requiere
+`PRODUCT_READ` o `CATEGORY_MANAGE`; toda escritura requiere `CATEGORY_MANAGE`.
+El contrato, búsqueda, transacciones y límites están detallados en
+`docs/security/categorias.md`.
+
+## Productos simples
+
+`POST` y `GET /api/v1/tenants/{tenantId}/products`, y `GET` y `PATCH
+/api/v1/tenants/{tenantId}/products/{productId}` crean, consultan y modifican
+productos simples. Requieren respectivamente `PRODUCT_CREATE`, `PRODUCT_READ`
+y `PRODUCT_UPDATE`. El contrato y las restricciones están en
+`docs/security/productos-simples.md`.
