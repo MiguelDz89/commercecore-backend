@@ -29,7 +29,7 @@ class SprintOnePackagedIT {
         String otherClient=token(KeycloakRealmResource.OTHER);
         UUID aAccount=account(adminA), bAccount=account(adminB), memberAccount=account(member), otherAccount=account(otherClient);
         account(platform);
-        UUID tenantA=create(platform,aAccount,"it-a-",List.of("CATALOG_OPERATOR"));
+        UUID tenantA=create(platform,aAccount,"it-a-",List.of("CATALOG_OPERATOR","CATALOG_MANAGER","PRICE_MANAGER"));
         UUID tenantB=create(platform,bAccount,"it-b-",List.of());
         assertEquals(1,countInitialAdministrator(tenantA,aAccount));
         assertEquals(1,countInitialAdministrator(tenantB,bAccount));
@@ -50,6 +50,25 @@ class SprintOnePackagedIT {
         given().auth().oauth2(member).post(a+"/memberships/"+membership+"/acceptance").then().statusCode(200);
         String assignment=a+"/memberships/"+membership+"/roles/"+role;
         given().auth().oauth2(adminA).put(assignment).then().statusCode(204);
+        // Temporary fixture: profiles do not yet provision the V5 tier-read permission.
+        try(var c=DriverManager.getConnection(SprintOneIntegrationResource.jdbc,SprintOneIntegrationResource.username,SprintOneIntegrationResource.password);
+            var q=c.prepareStatement("INSERT INTO role_permission(tenant_id,role_id,permission_code) SELECT tenant_id,role_id,'PRODUCT_PRICE_TIER_READ' FROM app_role WHERE tenant_id=? AND code='PRICE_MANAGER'")){
+            q.setObject(1,tenantA);q.executeUpdate();
+        }
+        String category=given().auth().oauth2(adminA).contentType("application/json").body(Map.of("code","IT","name","Integration"))
+                .post(a+"/categories").then().statusCode(201).extract().path("categoryId");
+        String product=given().auth().oauth2(adminA).contentType("application/json").body(Map.of("sku","IT-SKU","name","Product","categoryId",category))
+                .post(a+"/products").then().statusCode(201).extract().path("productId");
+        String prices=a+"/products/"+product+"/prices";
+        given().auth().oauth2(adminA).contentType("application/json").body("{\"version\":0,\"retailPrice\":12,\"tiers\":[{\"minimumQuantity\":6,\"unitPrice\":10}]}").put(prices+"/sale").then().statusCode(204);
+        given().auth().oauth2(adminA).get(prices).then().statusCode(200).body("configured",org.hamcrest.Matchers.is(true));
+        given().auth().oauth2(adminA).get(prices+"/tiers").then().statusCode(200).body("size()",org.hamcrest.Matchers.is(1));
+        given().auth().oauth2(adminA).queryParam("quantity",6).get(prices+"/quote").then().statusCode(200);
+        given().auth().oauth2(member).get(prices).then().statusCode(200);
+        given().auth().oauth2(member).get(prices+"/tiers").then().statusCode(404);
+        given().auth().oauth2(member).get(prices+"/cost").then().statusCode(404);
+        given().auth().oauth2(adminB).get(prices).then().statusCode(404);
+        given().auth().oauth2(platform).get(prices).then().statusCode(404);
         given().auth().oauth2(adminA).get(a+"/memberships/"+membership+"/roles").then().statusCode(200);
         given().auth().oauth2(adminA).get(a+"/roles/"+role+"/permissions").then().statusCode(200);
         given().auth().oauth2(adminA).delete(assignment).then().statusCode(204);

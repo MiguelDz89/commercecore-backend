@@ -119,3 +119,7 @@ El contrato, búsqueda, transacciones y límites están detallados en
 productos simples. Requieren respectivamente `PRODUCT_CREATE`, `PRODUCT_READ`
 y `PRODUCT_UPDATE`. El contrato y las restricciones están en
 `docs/security/productos-simples.md`.
+
+### Precios de productos
+
+Las seis rutas de precios y sus permisos están descritos en [precios-api.md](precios-api.md). El recorrido empaquetado usa únicamente una fixture SQL en PostgreSQL temporal para una capacidad que aún carece de concesión inicial de plataforma. La matriz de las seis operaciones registra la evidencia del OpenAPI servido.

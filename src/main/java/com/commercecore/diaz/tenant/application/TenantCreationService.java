@@ -22,9 +22,15 @@ public class TenantCreationService implements TenantCreation {
 
     @Override @Transactional(Transactional.TxType.MANDATORY)
     public CreatedTenant create(String slug, String legalName, String displayName, String currencyCode, String timeZone) {
+        return create(slug, legalName, displayName, currencyCode, timeZone, false);
+    }
+
+    @Override @Transactional(Transactional.TxType.MANDATORY)
+    public CreatedTenant create(String slug, String legalName, String displayName, String currencyCode, String timeZone,
+                                boolean fractionalQuantitiesEnabled) {
         if (!authorization.canCreate()) throw new SecurityException("Operation denied");
         var actor = authorization.actor().orElseThrow(() -> new SecurityException("Operation denied"));
-        Tenant tenant = Tenant.create(slug, legalName, displayName, currencyCode, timeZone);
+        Tenant tenant = Tenant.create(slug, legalName, displayName, currencyCode, timeZone, fractionalQuantitiesEnabled);
         guard.begin(tenant.tenantId());
         try { repository.create(tenant); }
         catch (RuntimeException e) {

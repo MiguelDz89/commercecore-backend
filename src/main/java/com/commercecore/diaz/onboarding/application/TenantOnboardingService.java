@@ -36,7 +36,8 @@ public class TenantOnboardingService implements TenantOnboarding {
         Set<CommercialProfile> profiles=command.commercialProfiles().stream()
                 .map(CommercialProfile::valueOf).collect(Collectors.toUnmodifiableSet());
         var accounts=identity.prepare(command.initialAdministratorAccountId());
-        var tenant=tenants.create(command.slug(),command.legalName(),command.displayName(),command.currencyCode(),command.timeZone());
+        var tenant=tenants.create(command.slug(),command.legalName(),command.displayName(),command.currencyCode(),command.timeZone(),
+                command.fractionalQuantitiesEnabled());
         var membership=identity.bootstrap(tenant,accounts,profiles);
         var auditEvidence=audit.recordCreation(tenant.tenantId(),accounts.actorAccountId());
         guard.complete(membership,auditEvidence);

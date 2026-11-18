@@ -14,6 +14,7 @@ public class TenantPersistenceMapper {
         entity.currencyCode = tenant.currencyCode();
         entity.timeZone = tenant.timeZone();
         entity.status = tenant.status();
+        entity.fractionalQuantitiesEnabled = tenant.fractionalQuantitiesEnabled();
         entity.createdAt = tenant.createdAt();
         entity.updatedAt = tenant.updatedAt();
         return entity;
@@ -21,6 +22,6 @@ public class TenantPersistenceMapper {
 
     Tenant toDomain(TenantJpaEntity entity) {
         return new Tenant(entity.tenantId, entity.slug, entity.legalName, entity.displayName,
-                entity.currencyCode, entity.timeZone, entity.status, entity.createdAt, entity.updatedAt);
+                entity.currencyCode, entity.timeZone, entity.status, entity.createdAt, entity.updatedAt, entity.fractionalQuantitiesEnabled);
     }
 }

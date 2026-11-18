@@ -14,10 +14,12 @@ public record CreateTenantRequest(
         @NotBlank @Size(max=80) @Pattern(regexp="^[a-z0-9]+(?:-[a-z0-9]+)*$") String slug,
         @NotBlank @Size(max=200) String legalName,
         @NotBlank @Size(max=160) String displayName,
-        @NotBlank @Pattern(regexp="^[A-Z]{3}$") String currencyCode,
+        @Pattern(regexp="^[A-Z]{3}$") @Schema(defaultValue="PEN") String currencyCode,
         @NotBlank @Size(max=64) String timeZone,
         @NotNull UUID initialAdministratorAccountId,
-        @NotNull @Size(max=32) Set<@NotBlank String> commercialProfiles) {
+        @NotNull @Size(max=32) Set<@NotBlank String> commercialProfiles,
+        @Schema(description="Habilita cantidades fraccionadas en la empresa desde el alta", defaultValue="false")
+        boolean fractionalQuantitiesEnabled) {
     @JsonAnySetter
     public void rejectUnknown(String name, Object value) { throw new IllegalArgumentException("Unknown request property"); }
 }

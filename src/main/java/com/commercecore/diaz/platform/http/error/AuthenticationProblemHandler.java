@@ -14,7 +14,7 @@ public class AuthenticationProblemHandler {
         router.route().failureHandler(ctx -> {
             String path=ctx.request().path();
             boolean api=path.equals("/api/v1/accounts/me/provisioning") || path.equals("/api/v1/platform/tenants")
-                    || path.matches("/api/v1/tenants/[^/]+/(?:memberships|roles|categories|products)(?:/.*)?")
+                    || path.matches("/api/v1/tenants/[^/]+/(?:memberships|roles|categories|products|exchange-rates)(?:/.*)?")
                     || path.matches("/api/v1/platform/tenants/[^/]+/administrators/[^/]+");
             if (api && !ctx.response().ended() && (ctx.statusCode()==401 || ctx.failure() instanceof AuthenticationFailedException)) {
                 ctx.response().setStatusCode(401).putHeader("Content-Type","application/problem+json");

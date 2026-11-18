@@ -41,7 +41,8 @@ public class TenantOnboardingResource {
     @APIResponse(responseCode="503",description="Dependencia temporalmente no disponible",content=@Content(mediaType="application/problem+json",schema=@Schema(implementation=ProblemDetails.class)))
     public Response create(@NotNull @Valid CreateTenantRequest request) {
         var result=onboarding.create(new CreateTenantCommand(request.slug(),request.legalName(),request.displayName(),
-                request.currencyCode(),request.timeZone(),request.initialAdministratorAccountId(),request.commercialProfiles()));
+                request.currencyCode(),request.timeZone(),request.initialAdministratorAccountId(),request.commercialProfiles(),
+                request.fractionalQuantitiesEnabled()));
         return Response.status(Response.Status.CREATED)
                 .entity(new TenantCreatedResponse(result.tenantId(),result.slug(),result.initialMembershipId())).build();
     }

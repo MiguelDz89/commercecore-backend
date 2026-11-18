@@ -254,12 +254,14 @@ class OidcPlatformAuthorizationTest {
         request.put("slug",slug); request.put("legalName","Empresa Legal"); request.put("displayName","Empresa");
         request.put("currencyCode","PEN"); request.put("timeZone","UTC");
         request.put("initialAdministratorAccountId",target.toString()); request.put("commercialProfiles",java.util.List.of());
+        request.put("fractionalQuantitiesEnabled",true);
         String path="/api/v1/platform/tenants";
         given().contentType("application/json").body(request).post(path).then().statusCode(401);
         for(String t:java.util.List.of(member,other,tenantAdmin,unprovisioned))
             given().auth().oauth2(t).contentType("application/json").body(request).post(path).then().statusCode(403);
         UUID id=UUID.fromString(given().auth().oauth2(admin).contentType("application/json").body(request).post(path)
                 .then().statusCode(201).extract().path("tenantId"));
+        assertEquals(1,sqlCount("SELECT count(*) FROM tenant WHERE tenant_id=? AND fractional_quantities_enabled",id));
         assertEquals(1,sqlCount("SELECT count(*) FROM tenant WHERE tenant_id=?",id));
         var duplicate=given().auth().oauth2(admin).contentType("application/json").body(request).post(path);
         duplicate.then().statusCode(409).contentType("application/problem+json");
@@ -331,10 +333,11 @@ class OidcPlatformAuthorizationTest {
     @Test
     void openApiDocumentsAdministrativeEndpointsAndBearer() throws Exception {
         String json=given().queryParam("format","json").get("/q/openapi").then().statusCode(200).extract().asString();
-        var document=new ObjectMapper().readTree(json);
+        var document=new ObjectMapper().enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).readTree(json);
         assertTrue(document.path("paths").has("/api/v1/accounts/me/provisioning"));
         assertTrue(document.path("paths").has("/api/v1/platform/tenants"));
         assertTrue(document.path("components").path("securitySchemes").has("bearerAuth"));
+        assertPriceOpenApi(document);
         String base="/api/v1/tenants/{tenantId}/memberships";
         assertTrue(document.path("paths").path(base).has("get"));
         assertTrue(document.path("paths").path(base).has("post"));
@@ -363,6 +366,696 @@ class OidcPlatformAuthorizationTest {
         assertTrue(document.path("paths").path(products).has("post"));
         assertTrue(document.path("paths").path(products+"/{productId}").has("get"));
         assertTrue(document.path("paths").path(products+"/{productId}").has("patch"));
+    }
+
+    @Test
+    void openApiDocumentsProductStatusChanges() throws Exception {
+        String json = given().queryParam("format", "json").get("/q/openapi").then().statusCode(200).extract().asString();
+        var document = new ObjectMapper().readTree(json);
+        String root = "/api/v1/tenants/{tenantId}/products";
+        var single = assertStatusChangeOperation(document, root + "/{productId}/status", "patch", "tenantId", "productId");
+        var batch = assertStatusChangeOperation(document, root + "/status-changes", "post", "tenantId");
+        assertEquals(java.util.Set.of("target", "version"), stringValues(single.path("required")));
+        assertEquals(java.util.Set.of("target", "items"), stringValues(batch.path("required")));
+        assertEquals(java.util.Set.of("target", "version", "reason"), fields(single.path("properties")));
+        assertEquals(java.util.Set.of("target", "items", "reason"), fields(batch.path("properties")));
+        for (var request : java.util.List.of(single, batch)) {
+            assertEquals(com.fasterxml.jackson.databind.node.BooleanNode.FALSE, request.path("additionalProperties"));
+            var target = priceSchema(document, request.path("properties").path("target"));
+            assertEquals(java.util.Set.of("PENDING_RECEIPT", "ACTIVE", "INACTIVE", "ARCHIVED"), stringValues(target.path("enum")));
+            var reason = request.path("properties").path("reason");
+            assertPriceType(reason, "string", "", true);
+            assertTrue(reason.path("description").asText().contains("INACTIVE y ARCHIVED"));
+        }
+        var items = batch.path("properties").path("items");
+        assertPriceType(items, "array", "", false);
+        assertEquals(1, items.path("minItems").asInt());
+        var item = priceSchema(document, items.path("items"));
+        assertFields(item, "productId", "version");
+        assertEquals(com.fasterxml.jackson.databind.node.BooleanNode.FALSE, item.path("additionalProperties"));
+        assertPriceType(priceSchema(document, item.path("properties").path("productId")), "string", "uuid", false);
+        for (var schema : java.util.List.of(single, item)) {
+            var version = schema.path("properties").path("version");
+            assertPriceType(version, "integer", "int64", false);
+            assertTrue(version.path("minimum").isNumber());
+            assertEquals(0, version.path("minimum").asInt());
+        }
+    }
+
+    private static com.fasterxml.jackson.databind.JsonNode assertStatusChangeOperation(
+            com.fasterxml.jackson.databind.JsonNode document, String route, String method, String... pathIds) {
+        var path = document.path("paths").path(route);
+        var operation = path.path(method);
+        assertTrue(operation.isObject(), route);
+        assertEquals(java.util.Set.of("bearerAuth"), fields(operation.path("security").get(0)));
+        var ids = new java.util.HashSet<String>();
+        for (var parent : java.util.List.of(path, operation)) {
+            for (var parameter : parent.path("parameters")) {
+                var resolved = priceSchema(document, parameter);
+                assertEquals("path", resolved.path("in").asText());
+                assertTrue(resolved.path("required").asBoolean());
+                assertPriceType(priceSchema(document, resolved.path("schema")), "string", "uuid", false);
+                ids.add(resolved.path("name").asText());
+            }
+        }
+        assertEquals(java.util.Set.of(pathIds), ids);
+        var responses = operation.path("responses");
+        assertEquals(java.util.Set.of("200", "400", "401", "404", "409", "500", "503"), fields(responses));
+        var success = priceSchema(document, responses.path("200").path("content").path("application/json").path("schema"));
+        assertFields(success, "correlationId");
+        assertPriceType(priceSchema(document, success.path("properties").path("correlationId")), "string", "uuid", false);
+        for (String code : java.util.List.of("400", "401", "404", "500", "503")) {
+            var error = priceSchema(document, responses.path(code).path("content").path("application/problem+json").path("schema"));
+            assertFields(error, "type", "title", "status", "detail", "instance", "correlationId");
+        }
+        assertStatusConflictSchema(document,
+                responses.path("409").path("content").path("application/problem+json").path("schema"));
+        var request = operation.path("requestBody");
+        assertTrue(request.path("required").asBoolean());
+        return priceSchema(document, request.path("content").path("application/json").path("schema"));
+    }
+
+    private static void assertStatusConflictSchema(com.fasterxml.jackson.databind.JsonNode document,
+                                                   com.fasterxml.jackson.databind.JsonNode schema) {
+        var alternatives = priceSchema(document, schema).path("anyOf");
+        assertEquals(2, alternatives.size(), schema.toString());
+        var problem = priceSchema(document, alternatives.get(0));
+        assertFields(problem, "type", "title", "status", "detail", "instance", "correlationId");
+        var extension = priceSchema(document, alternatives.get(1));
+        var inherited = new java.util.ArrayList<com.fasterxml.jackson.databind.JsonNode>();
+        extension.path("allOf").forEach(part -> inherited.add(priceSchema(document, part)));
+        assertTrue(inherited.contains(problem), extension.toString());
+        inherited.add(extension);
+        var conflictProperties = inherited.stream().filter(part -> part.path("properties").has("conflicts"))
+                .findFirst().orElseThrow();
+        var expected = new java.util.HashSet<>(fields(problem.path("properties")));
+        expected.add("conflicts");
+        var effectiveProperties = new java.util.HashSet<String>();
+        var effectiveRequired = new java.util.HashSet<String>();
+        for (var part : inherited) {
+            effectiveProperties.addAll(fields(part.path("properties")));
+            effectiveRequired.addAll(stringValues(part.path("required")));
+        }
+        assertEquals(expected, effectiveProperties);
+        assertEquals(expected, effectiveRequired);
+        var conflicts = conflictProperties.path("properties").path("conflicts");
+        assertPriceType(conflicts, "array", "", false);
+        assertEquals(1, conflicts.path("minItems").asInt());
+        var item = priceSchema(document, conflicts.path("items"));
+        assertEquals(java.util.Set.of("productId", "code", "variantId"), fields(item.path("properties")));
+        assertEquals(java.util.Set.of("productId", "code"), stringValues(item.path("required")));
+        for (String id : java.util.List.of("productId", "variantId")) {
+            assertPriceType(priceSchema(document, item.path("properties").path(id)), "string", "uuid", false);
+        }
+        var code = priceSchema(document, item.path("properties").path("code"));
+        assertEquals(java.util.Set.of("VERSION_CONFLICT", "INVALID_TRANSITION", "UNARCHIVED_VARIANT", "CONCURRENT_MODIFICATION"),
+                stringValues(code.path("enum")));
+    }
+
+    private static java.util.Set<String> stringValues(com.fasterxml.jackson.databind.JsonNode array) {
+        var values = new java.util.HashSet<String>();
+        array.forEach(value -> values.add(value.asText()));
+        return values;
+    }
+
+    @Test
+    void changesProductStatusThroughBothAuthenticatedRoutes() throws Exception {
+        String admin = token(KeycloakRealmResource.ADMIN, "commercecore-api");
+        var fixture = statusFixture(admin);
+        UUID tenant = fixture.tenant();
+        String products = fixture.products();
+        var ids = new java.util.ArrayList<String>();
+        for (String sku : java.util.List.of("SKU-1", "SKU-2")) {
+            ids.add(createStatusProduct(admin, fixture, java.util.Map.of("sku", sku, "name", sku)));
+        }
+        String single = products + "/" + ids.getFirst() + "/status";
+        String batch = products + "/status-changes";
+        String activation = """
+                {"target":"ACTIVE","version":0}
+                """;
+        String archiving = """
+                {"target":"ARCHIVED","reason":"Fin de vida","items":[
+                    {"productId":"%s","version":1},{"productId":"%s","version":0}]}
+                """.formatted(ids.getFirst(), ids.getLast());
+        given().contentType("application/json").body(activation).patch(single).then().statusCode(401)
+                .header("WWW-Authenticate", org.hamcrest.Matchers.startsWith("Bearer"));
+        given().auth().oauth2("invalid").contentType("application/json").body(archiving).post(batch)
+                .then().statusCode(401).contentType("application/problem+json");
+
+        for (String invalid : java.util.List.of(
+                "{\"target\":\"ACTIVE\",\"version\":0,\"productId\":\"ignored\"}",
+                "{\"target\":\"ACTIVE\",\"version\":0,\"tenantId\":\"ignored\"}",
+                "{\"target\":\"ACTIVE\",\"version\":0.0}",
+                "{\"target\":\"ACTIVE\",\"version\":-1}",
+                "{\"target\":\"ACTIVE\",\"version\":9223372036854775808}",
+                "{\"target\":\"ACTIVE\"}", "{\"target\":\"DRAFT\",\"version\":0}",
+                "{\"target\":\"INACTIVE\",\"version\":0,\"reason\":\" \"}",
+                activation + "{}")) {
+            given().auth().oauth2(admin).contentType("application/json").body(invalid).patch(single)
+                    .then().statusCode(400).contentType("application/problem+json").body("status", is(400));
+        }
+        given().auth().oauth2(admin).contentType("application/json").body(activation)
+                .patch(products + "/1-1-1-1-1/status").then().statusCode(400);
+        given().auth().oauth2(admin).contentType("application/json").body(activation)
+                .patch(single.replace(tenant.toString(), "invalid-tenant")).then().statusCode(400);
+        given().auth().oauth2(admin).contentType("application/json").body("{\"status\":\"ACTIVE\",\"version\":0}")
+                .patch(products + "/" + ids.getFirst()).then().statusCode(400);
+
+        for (String invalid : java.util.List.of(
+                "{\"target\":\"ACTIVE\",\"items\":[]}",
+                "{\"target\":\"ACTIVE\",\"items\":[null]}",
+                "{\"target\":\"ARCHIVED\",\"items\":[{\"productId\":\"%s\",\"version\":0}]}".formatted(ids.getFirst()),
+                "{\"target\":\"ACTIVE\",\"items\":[{\"productId\":\"not-a-uuid\",\"version\":0}]}",
+                "{\"target\":\"ACTIVE\",\"items\":[{\"productId\":\"%s\",\"version\":0,\"tenantId\":\"ignored\"}]}".formatted(ids.getFirst()),
+                "{\"target\":\"ACTIVE\",\"items\":[{\"productId\":\"%s\",\"version\":0},{\"productId\":\"%s\",\"version\":1}]}".formatted(ids.getFirst(), ids.getFirst()))) {
+            given().auth().oauth2(admin).contentType("application/json").body(invalid).post(batch)
+                    .then().statusCode(400).contentType("application/problem+json").body("status", is(400));
+        }
+
+        String activationId = given().auth().oauth2(admin).contentType("application/json").body(activation).patch(single)
+                .then().statusCode(200).extract().path("correlationId");
+        assertEquals(activationId, UUID.fromString(activationId).toString());
+        assertEquals(1, sqlCount("""
+                SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND correlation_id=?
+                AND action='PRODUCT_STATUS_CHANGED' AND after_data->>'status'='ACTIVE'
+                """, tenant, UUID.fromString(ids.getFirst()), activationId));
+        given().auth().oauth2(admin).contentType("application/json")
+                .body("{\"target\":\"PENDING_RECEIPT\",\"version\":0}").patch(single)
+                .then().statusCode(409).contentType("application/problem+json").body("status", is(409))
+                .body("conflicts", is(java.util.List.of(java.util.Map.of("productId", ids.getFirst(), "code", "VERSION_CONFLICT"))));
+
+        String archiveId = given().auth().oauth2(admin).contentType("application/json").body(archiving).post(batch)
+                .then().statusCode(200).extract().path("correlationId");
+        assertEquals(archiveId, UUID.fromString(archiveId).toString());
+        assertEquals(2, sqlCount("""
+                SELECT count(DISTINCT entity_id) FROM audit_event WHERE tenant_id=? AND correlation_id=?
+                AND entity_id IN (?,?) AND action='PRODUCT_STATUS_CHANGED' AND after_data->>'status'='ARCHIVED'
+                """, tenant, archiveId, UUID.fromString(ids.getFirst()), UUID.fromString(ids.getLast())));
+    }
+
+    @Test
+    void returnsAuthorizedProductStatusConflictsWithoutLeakingOrChangingTheBatch() throws Exception {
+        String admin = token(KeycloakRealmResource.ADMIN, "commercecore-api");
+        var fixture = statusFixture(admin);
+        var foreign = statusFixture(admin);
+        String validId = createStatusProduct(admin, fixture, java.util.Map.of("sku", "VALID", "name", "Producto válido"));
+        String archivedId = createStatusProduct(admin, fixture, java.util.Map.of("sku", "ARCHIVED", "name", "Archivado"));
+        String groupId = createStatusProduct(admin, fixture, java.util.Map.of("type", "VARIABLE", "name", "Agrupador"));
+        var variantIds = new java.util.ArrayList<String>();
+        for (String size : java.util.List.of("S", "M")) {
+            variantIds.add(createStatusProduct(admin, fixture, java.util.Map.of(
+                    "type", "VARIANT", "parentId", groupId, "sku", "GROUP-" + size, "name", "Variante " + size,
+                    "attributes", java.util.Map.of("size", size))));
+        }
+        String foreignId = createStatusProduct(admin, foreign, java.util.Map.of("sku", "FOREIGN", "name", "Ajeno"));
+        try (var connection = dataSource.getConnection();
+                var activate = connection.prepareStatement("""
+                        UPDATE product SET status='ACTIVE', published=true, ever_published=true
+                        WHERE tenant_id=? AND product_id IN (?,?)
+                        """);
+                var archive = connection.prepareStatement("""
+                        UPDATE product SET status='ARCHIVED' WHERE tenant_id=? AND product_id=?
+                        """)) {
+            activate.setObject(1, fixture.tenant());
+            activate.setObject(2, UUID.fromString(validId));
+            activate.setObject(3, UUID.fromString(groupId));
+            assertEquals(2, activate.executeUpdate());
+            archive.setObject(1, fixture.tenant());
+            archive.setObject(2, UUID.fromString(archivedId));
+            assertEquals(1, archive.executeUpdate());
+        }
+        String before = productRows(fixture.tenant());
+        String foreignBefore = productRows(foreign.tenant());
+        var mapper = new ObjectMapper();
+        var request = mapper.createObjectNode().put("target", "ARCHIVED").put("reason", "Fin de vida");
+        var items = request.putArray("items");
+        items.addObject().put("productId", validId).put("version", 0);
+        items.addObject().put("productId", groupId).put("version", 0);
+        items.addObject().put("productId", archivedId).put("version", 1);
+        String path = fixture.products() + "/status-changes";
+        var result = mapper.readTree(given().auth().oauth2(admin).contentType("application/json").body(request.toString())
+                .post(path).then().statusCode(409).contentType("application/problem+json").extract().asString());
+        assertEquals(java.util.Set.of("type", "title", "status", "detail", "instance", "correlationId", "conflicts"), fields(result));
+        assertEquals(path, result.path("instance").asText());
+        assertEquals(409, result.path("status").asInt());
+        UUID.fromString(result.path("correlationId").asText());
+        var expected = new java.util.HashSet<com.fasterxml.jackson.databind.JsonNode>();
+        expected.add(mapper.createObjectNode().put("productId", archivedId).put("code", "VERSION_CONFLICT"));
+        expected.add(mapper.createObjectNode().put("productId", archivedId).put("code", "INVALID_TRANSITION"));
+        for (String variantId : variantIds) {
+            expected.add(mapper.createObjectNode().put("productId", groupId).put("code", "UNARCHIVED_VARIANT")
+                    .put("variantId", variantId));
+        }
+        var conflicts = result.path("conflicts");
+        var actual = new java.util.HashSet<com.fasterxml.jackson.databind.JsonNode>();
+        conflicts.forEach(actual::add);
+        assertEquals(expected.size(), conflicts.size());
+        assertEquals(expected, actual);
+
+        given().auth().oauth2(admin).contentType("application/json").body("{\"target\":\"ACTIVE\",\"version\":0}")
+                .patch(fixture.products() + "/" + archivedId + "/status")
+                .then().statusCode(409).contentType("application/problem+json")
+                .body("conflicts", is(java.util.List.of(java.util.Map.of("productId", archivedId, "code", "INVALID_TRANSITION"))));
+
+        var forbiddenItem = items.addObject().put("version", 0);
+        forbiddenItem.put("productId", foreignId);
+        String denied = given().auth().oauth2(admin).contentType("application/json").body(request.toString())
+                .post(path).then().statusCode(404).contentType("application/problem+json").extract().asString();
+        forbiddenItem.put("productId", UUID.randomUUID().toString());
+        String missing = given().auth().oauth2(admin).contentType("application/json").body(request.toString())
+                .post(path).then().statusCode(404).contentType("application/problem+json").extract().asString();
+        var deniedProblem = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(denied);
+        var missingProblem = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(missing);
+        deniedProblem.remove("correlationId");
+        missingProblem.remove("correlationId");
+        assertEquals(missingProblem, deniedProblem);
+        assertFalse(deniedProblem.has("conflicts"));
+        assertFalse(denied.contains(foreignId));
+        assertFalse(denied.contains("FOREIGN"));
+        assertEquals(before, productRows(fixture.tenant()));
+        assertEquals(foreignBefore, productRows(foreign.tenant()));
+        assertEquals(0, sqlCount("""
+                SELECT count(*) FROM audit_event WHERE tenant_id IN (?,?) AND action='PRODUCT_STATUS_CHANGED'
+                """, fixture.tenant(), foreign.tenant()));
+    }
+
+    private record StatusFixture(UUID tenant, String category, String products) { }
+
+    private StatusFixture statusFixture(String admin) throws Exception {
+        UUID account = provision(admin);
+        var setup = java.util.Map.of("slug", "status-" + UUID.randomUUID(), "legalName", "Empresa",
+                "displayName", "Empresa", "currencyCode", "PEN", "timeZone", "UTC",
+                "initialAdministratorAccountId", account.toString(), "commercialProfiles", java.util.List.of("CATALOG_MANAGER"));
+        UUID tenant = UUID.fromString(given().auth().oauth2(admin).contentType("application/json").body(setup)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId"));
+        try (var connection = dataSource.getConnection(); var grant = connection.prepareStatement("""
+                INSERT INTO role_permission (tenant_id,role_id,permission_code)
+                SELECT tenant_id,role_id,'PRODUCT_STATUS_UPDATE' FROM app_role WHERE tenant_id=? AND code='CATALOG_MANAGER'
+                """)) {
+            grant.setObject(1, tenant);
+            assertEquals(1, grant.executeUpdate());
+        }
+        String tenantPath = "/api/v1/tenants/" + tenant;
+        String category = given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("code", "CAT", "name", "Categoría"))
+                .post(tenantPath + "/categories").then().statusCode(201).extract().path("categoryId");
+        return new StatusFixture(tenant, category, tenantPath + "/products");
+    }
+
+    private static String createStatusProduct(String admin, StatusFixture fixture, java.util.Map<String, ?> values) {
+        var request = new java.util.HashMap<String, Object>(values);
+        request.put("categoryId", fixture.category());
+        return given().auth().oauth2(admin).contentType("application/json").body(request)
+                .post(fixture.products()).then().statusCode(201).extract().path("productId");
+    }
+
+    private String productRows(UUID tenant) throws Exception {
+        try (var connection = dataSource.getConnection(); var query = connection.prepareStatement("""
+                SELECT jsonb_agg(to_jsonb(p) ORDER BY p.product_id)::text FROM product p WHERE p.tenant_id=?
+                """)) {
+            query.setObject(1, tenant);
+            try (var rows = query.executeQuery()) {
+                assertTrue(rows.next());
+                return rows.getString(1);
+            }
+        }
+    }
+
+    @Test
+    void enforcesBothQuantitySettingsAndProtectsCommercialUnits() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        UUID account=provision(admin);
+        for (boolean companyFractional : new boolean[]{false,true}) {
+            var setup=java.util.Map.of("slug","quantity-"+UUID.randomUUID(),"legalName","Empresa",
+                    "displayName","Empresa","currencyCode","PEN","timeZone","UTC",
+                    "initialAdministratorAccountId",account.toString(),
+                    "commercialProfiles",java.util.List.of("CATALOG_MANAGER","PRICE_MANAGER"),
+                    "fractionalQuantitiesEnabled",companyFractional);
+            UUID tenant=UUID.fromString(given().auth().oauth2(admin).contentType("application/json").body(setup)
+                    .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId"));
+            try (var c=dataSource.getConnection(); var statement=c.prepareStatement("""
+                    INSERT INTO role_permission (tenant_id,role_id,permission_code)
+                    SELECT tenant_id,role_id,'PRODUCT_PRICE_TIER_READ' FROM app_role
+                    WHERE tenant_id=? AND code='PRICE_MANAGER'
+                    """)) {
+                statement.setObject(1,tenant);
+                assertEquals(1,statement.executeUpdate());
+            }
+            String base="/api/v1/tenants/"+tenant;
+            String category=given().auth().oauth2(admin).contentType("application/json")
+                    .body(java.util.Map.of("code","QUANTITY","name","Cantidad"))
+                    .post(base+"/categories").then().statusCode(201).extract().path("categoryId");
+            for (boolean productFractional : new boolean[]{false,true}) {
+                String product=given().auth().oauth2(admin).contentType("application/json")
+                        .body(java.util.Map.of("categoryId",category,"sku","qty-"+productFractional,"name","Cable",
+                                "baseUnit","CM","fractionalQuantitiesEnabled",productFractional))
+                        .post(base+"/products").then().statusCode(201).body("baseUnit",is("CM"))
+                        .extract().path("productId");
+                String productPath=base+"/products/"+product;
+                given().auth().oauth2(admin).contentType("application/json").body("{\"version\":0,\"baseUnit\":\"M\"}")
+                        .patch(productPath).then().statusCode(200).body("baseUnit",is("M"));
+                String sale="{\"version\":1,\"retailPrice\":20,\"tiers\":[{\"minimumQuantity\":2.5,\"unitPrice\":15}]}";
+                boolean permitted=companyFractional && productFractional;
+                given().auth().oauth2(admin).contentType("application/json").body(sale)
+                        .put(productPath+"/prices/sale").then().statusCode(permitted?204:400);
+                if (!permitted) {
+                    given().auth().oauth2(admin).contentType("application/json").body(sale.replace("2.5","3"))
+                            .put(productPath+"/prices/sale").then().statusCode(204);
+                }
+                given().auth().oauth2(admin).queryParam("quantity","2.500").get(productPath+"/prices/quote")
+                        .then().statusCode(permitted?200:400);
+                given().auth().oauth2(admin).queryParam("quantity","5.000").get(productPath+"/prices/quote")
+                        .then().statusCode(200);
+                given().auth().oauth2(admin).queryParam("quantity","2,5").get(productPath+"/prices/quote")
+                        .then().statusCode(400);
+                given().auth().oauth2(admin).queryParam("quantity","2.5001").get(productPath+"/prices/quote")
+                        .then().statusCode(400);
+                given().auth().oauth2(admin).contentType("application/json").body("{\"version\":2,\"baseUnit\":\"CM\"}")
+                        .patch(productPath).then().statusCode(409);
+                if (permitted) {
+                    var quote = given().auth().oauth2(admin).queryParam("quantity","2.5").get(productPath+"/prices/quote")
+                            .then().statusCode(200).extract().response();
+                    assertEquals(0,new java.math.BigDecimal(quote.jsonPath().get("unitPrice").toString())
+                            .compareTo(new java.math.BigDecimal("15")));
+                    given().auth().oauth2(admin).contentType("application/json")
+                            .body("{\"version\":2,\"fractionalQuantitiesEnabled\":false}").patch(productPath).then().statusCode(409);
+                    assertEquals(1,sqlCount("SELECT count(*) FROM product_price_tier WHERE tenant_id=? AND product_id=? AND minimum_quantity=2.500",
+                            tenant,UUID.fromString(product)));
+                }
+            }
+        }
+    }
+
+    @Test
+    void recordsForeignCostUsingLatestPriorRateWithoutRecalculatingHistory() throws Exception {
+        String token=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        UUID actor=provision(token);
+        var setup=java.util.Map.of("slug","money-"+UUID.randomUUID(),"legalName","Empresa",
+                "displayName","Empresa","currencyCode","EUR","timeZone","UTC",
+                "initialAdministratorAccountId",actor.toString(),
+                "commercialProfiles",java.util.List.of("CATALOG_MANAGER","PRICE_MANAGER"));
+        UUID tenant=UUID.fromString(given().auth().oauth2(token).contentType("application/json").body(setup)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId"));
+        String base="/api/v1/tenants/"+tenant;
+        String category=given().auth().oauth2(token).contentType("application/json")
+                .body(java.util.Map.of("code","MONEDA","name","Moneda"))
+                .post(base+"/categories").then().statusCode(201).extract().path("categoryId");
+        UUID product=UUID.fromString(given().auth().oauth2(token).contentType("application/json")
+                .body(java.util.Map.of("categoryId",category,"sku","CURRENCY","name","Cable"))
+                .post(base+"/products").then().statusCode(201).extract().path("productId"));
+        String prices=base+"/products/"+product+"/prices";
+        given().auth().oauth2(token).get(prices).then().statusCode(200).body("currency",is("EUR"));
+        String rates=base+"/exchange-rates/USD/";
+        var rateRequest=java.util.Map.of("rate",new java.math.BigDecimal("0.73000000"));
+        given().auth().oauth2(token).contentType("application/json").body(rateRequest)
+                .put(rates+"2026-11-16").then().statusCode(404);
+
+        // Future provisioning uses the approved profiles. This fixture isolates each endpoint's permission.
+        try (var c=dataSource.getConnection(); var statement=c.prepareStatement("""
+                INSERT INTO role_permission (tenant_id,role_id,permission_code)
+                SELECT r.tenant_id,r.role_id,p.code FROM app_role r CROSS JOIN
+                    (VALUES ('PURCHASE_EXCHANGE_RATE_UPDATE'),('PRODUCT_COST_UPDATE')) AS p(code)
+                WHERE r.tenant_id=? AND r.code='PRICE_MANAGER'
+                """)) {
+            statement.setObject(1,tenant);
+            assertEquals(2,statement.executeUpdate());
+        }
+        var acquisition=java.util.Map.of("version",0,"cost",100,"sourceCurrency","USD","operationDate","2026-11-17");
+        given().auth().oauth2(token).contentType("application/json").body(acquisition)
+                .put(prices+"/cost").then().statusCode(409);
+        given().auth().oauth2(token).contentType("application/json").body(rateRequest)
+                .put(rates+"2026-11-16").then().statusCode(204);
+        given().auth().oauth2(token).contentType("application/json").body(java.util.Map.of("rate",2))
+                .put(rates+"2026-11-18").then().statusCode(204);
+        given().auth().oauth2(token).get(rates+"2026-11-16").then().statusCode(404);
+        given().auth().oauth2(token).contentType("application/json").body(acquisition)
+                .put(prices+"/cost").then().statusCode(204);
+        given().auth().oauth2(token).get(prices+"/cost").then().statusCode(404);
+        given().auth().oauth2(token).contentType("application/json").body(java.util.Map.of("rate",1))
+                .put(rates+"2026-11-16").then().statusCode(204);
+
+        try (var c=dataSource.getConnection(); var statement=c.prepareStatement("""
+                INSERT INTO role_permission (tenant_id,role_id,permission_code)
+                SELECT r.tenant_id,r.role_id,p.code FROM app_role r CROSS JOIN
+                    (VALUES ('PURCHASE_EXCHANGE_RATE_READ'),('PRODUCT_COST_READ')) AS p(code)
+                WHERE r.tenant_id=? AND r.code='PRICE_MANAGER'
+                """)) {
+            statement.setObject(1,tenant);
+            assertEquals(2,statement.executeUpdate());
+        }
+        given().auth().oauth2(token).get(rates+"2026-11-16").then().statusCode(200).body("target",is("EUR"));
+        String payload=given().auth().oauth2(token).get(prices+"/cost").then().statusCode(200).extract().asString();
+        var result=new ObjectMapper().enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                .readTree(payload);
+        assertEquals(0,new java.math.BigDecimal("73.00").compareTo(result.path("cost").decimalValue()));
+        assertEquals("2026-11-16",result.path("acquisition").path("rateDate").asText());
+        assertEquals("USD",result.path("acquisition").path("sourceCurrency").asText());
+        assertEquals(actor.toString(),result.path("acquisition").path("recordedBy").asText());
+        assertEquals(0,new java.math.BigDecimal("0.73").compareTo(result.path("acquisition").path("rate").decimalValue()));
+        assertEquals(1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_COST_UPDATED'",tenant,product));
+        assertEquals(3,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND action='PURCHASE_EXCHANGE_RATE_UPDATED'",tenant));
+
+        var otherSetup=new java.util.HashMap<>(setup);
+        otherSetup.put("slug","other-money-"+UUID.randomUUID());
+        UUID second=UUID.fromString(given().auth().oauth2(token).contentType("application/json").body(otherSetup)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId"));
+        try (var c=dataSource.getConnection(); var statement=c.prepareStatement("""
+                INSERT INTO role_permission (tenant_id,role_id,permission_code)
+                SELECT tenant_id,role_id,'PURCHASE_EXCHANGE_RATE_READ' FROM app_role
+                WHERE tenant_id=? AND code='PRICE_MANAGER'
+                """)) {
+            statement.setObject(1,second);
+            assertEquals(1,statement.executeUpdate());
+        }
+        given().auth().oauth2(token).get("/api/v1/tenants/"+second+"/exchange-rates/USD/2026-11-16")
+                .then().statusCode(404);
+
+        String suffix=UUID.randomUUID().toString().replace("-","");
+        String function="purchase_audit_function_"+suffix;
+        String trigger="purchase_audit_trigger_"+suffix;
+        try {
+            try (var c=dataSource.getConnection(); var statement=c.createStatement()) {
+                statement.execute("CREATE FUNCTION "+function+"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                        +"IF NEW.tenant_id='"+tenant+"' AND NEW.action IN ('PURCHASE_EXCHANGE_RATE_UPDATED','PRODUCT_COST_UPDATED') "
+                        +"THEN RAISE EXCEPTION 'audit fixture'; END IF; RETURN NEW; END $$");
+                statement.execute("CREATE TRIGGER "+trigger+" BEFORE INSERT ON audit_event FOR EACH ROW EXECUTE FUNCTION "+function+"()");
+            }
+            given().auth().oauth2(token).contentType("application/json").body(rateRequest)
+                    .put(rates+"2026-11-14").then().statusCode(500);
+            given().auth().oauth2(token).contentType("application/json")
+                    .body(java.util.Map.of("version",1,"cost",200,"sourceCurrency","USD","operationDate","2026-11-17"))
+                    .put(prices+"/cost").then().statusCode(500);
+            assertEquals(0,sqlCount("SELECT count(*) FROM purchase_exchange_rate WHERE tenant_id=? AND rate_date=DATE '2026-11-14'",tenant));
+            assertEquals(1,sqlCount("SELECT count(*) FROM product WHERE tenant_id=? AND product_id=? AND version=1 AND cost_price=73 AND cost_source_amount=100",tenant,product));
+        } finally {
+            try (var c=dataSource.getConnection(); var statement=c.createStatement()) {
+                statement.execute("DROP TRIGGER IF EXISTS "+trigger+" ON audit_event");
+                statement.execute("DROP FUNCTION IF EXISTS "+function+"()");
+            }
+        }
+    }
+
+    private static void assertPriceOpenApi(com.fasterxml.jackson.databind.JsonNode document) {
+        String root = "/api/v1/tenants/{tenantId}/products/{productId}/prices";
+        var bearer = document.path("components").path("securitySchemes").path("bearerAuth");
+        assertEquals("http", bearer.path("type").asText());
+        assertEquals("bearer", bearer.path("scheme").asText());
+        assertEquals("JWT", bearer.path("bearerFormat").asText());
+        var paths = document.path("paths");
+        assertPriceOperation(document, paths.path(root), "get", "200", false, false);
+        assertPriceOperation(document, paths.path(root+"/tiers"), "get", "200", false, false);
+        assertPriceOperation(document, paths.path(root+"/quote"), "get", "200", true, true);
+        assertPriceOperation(document, paths.path(root+"/cost"), "get", "200", false, false);
+        assertPriceOperation(document, paths.path(root+"/sale"), "put", "204", true, false);
+        assertPriceOperation(document, paths.path(root+"/cost"), "put", "204", true, false);
+
+        var retail = priceSchema(document, paths.path(root).path("get").path("responses").path("200").path("content").path("application/json").path("schema"));
+        var cost = priceSchema(document, paths.path(root+"/cost").path("get").path("responses").path("200").path("content").path("application/json").path("schema"));
+        var quote = priceSchema(document, paths.path(root+"/quote").path("get").path("responses").path("200").path("content").path("application/json").path("schema"));
+        var tiers = priceSchema(document, paths.path(root+"/tiers").path("get").path("responses").path("200").path("content").path("application/json").path("schema"));
+        assertFields(retail, "configured","retailPrice","currency","version");
+        assertFields(cost, "cost","version","currency","acquisition");
+        assertPriceType(cost.path("properties").path("currency"),"string","",false);
+        var acquisitionProperty=cost.path("properties").path("acquisition");
+        var acquisition=nullableOpenApiObject(document,acquisitionProperty);
+        assertFields(acquisition,"sourceAmount","sourceCurrency","operationDate","rateDate","rate","recordedBy");
+        assertMoney(acquisition.path("properties").path("sourceAmount"),false);
+        assertPriceType(acquisition.path("properties").path("sourceCurrency"),"string","",false);
+        assertPriceType(acquisition.path("properties").path("operationDate"),"string","date",false);
+        assertPriceType(acquisition.path("properties").path("rateDate"),"string","date",true);
+        assertPriceType(priceSchema(document,acquisition.path("properties").path("recordedBy")),"string","uuid",false);
+        var rate=acquisition.path("properties").path("rate");
+        assertPriceType(rate,"number","",true);
+        assertNumber(rate,"minimum","0.00000001");
+        assertNumber(rate,"exclusiveMaximum","10000000000");
+        assertNumber(rate,"multipleOf","0.00000001");
+        assertFields(quote, "quantity","unitPrice");
+        assertPriceType(retail.path("properties").path("configured"), "boolean", "", false);
+        assertPriceType(retail.path("properties").path("currency"), "string", "", false);
+        assertQuantity(quote.path("properties").path("quantity"),"0.001");
+        assertMoney(retail.path("properties").path("retailPrice"), true);
+        assertMoney(cost.path("properties").path("cost"), true);
+        assertMoney(quote.path("properties").path("unitPrice"), false);
+        assertVersion(retail.path("properties").path("version"));
+        assertVersion(cost.path("properties").path("version"));
+        assertPriceTiers(document, tiers, "0.001");
+
+        var saleRequest = priceSchema(document, paths.path(root+"/sale").path("put").path("requestBody").path("content").path("application/json").path("schema"));
+        var costRequest = priceSchema(document, paths.path(root+"/cost").path("put").path("requestBody").path("content").path("application/json").path("schema"));
+        assertFields(saleRequest, "version","retailPrice","tiers");
+        assertPriceType(costRequest,"object","",false);
+        assertEquals(java.util.Set.of("version","cost","sourceCurrency","operationDate"),fields(costRequest.path("properties")));
+        var requiredCostFields=new java.util.HashSet<String>();
+        costRequest.path("required").forEach(field -> requiredCostFields.add(field.asText()));
+        assertEquals(java.util.Set.of("version","cost"),requiredCostFields);
+        assertPriceType(costRequest.path("properties").path("sourceCurrency"),"string","",false);
+        assertPriceType(costRequest.path("properties").path("operationDate"),"string","date",false);
+        assertEquals(com.fasterxml.jackson.databind.node.BooleanNode.FALSE,saleRequest.path("additionalProperties"));
+        assertEquals(com.fasterxml.jackson.databind.node.BooleanNode.FALSE,costRequest.path("additionalProperties"));
+        assertVersion(saleRequest.path("properties").path("version"));
+        assertVersion(costRequest.path("properties").path("version"));
+        assertMoney(saleRequest.path("properties").path("retailPrice"), false);
+        assertMoney(costRequest.path("properties").path("cost"), true);
+        assertPriceTiers(document,saleRequest.path("properties").path("tiers"),"2");
+    }
+
+    private static void assertPriceOperation(com.fasterxml.jackson.databind.JsonNode document,
+            com.fasterxml.jackson.databind.JsonNode path, String method, String success, boolean conflict, boolean quantity) {
+        var operation = path.path(method);
+        assertTrue(operation.isObject(), path.toString());
+        assertEquals(1, operation.path("security").size());
+        assertEquals(java.util.Set.of("bearerAuth"), fields(operation.path("security").get(0)));
+        assertTrue(operation.path("security").get(0).path("bearerAuth").isArray());
+        assertEquals(0,operation.path("security").get(0).path("bearerAuth").size());
+        var params = new java.util.HashMap<String,com.fasterxml.jackson.databind.JsonNode>();
+        for (var source : java.util.List.of(path, operation))
+            for (var parameter : source.path("parameters")) {
+                var resolved = priceSchema(document, parameter);
+                params.put(resolved.path("name").asText(), resolved);
+            }
+        assertEquals(quantity ? java.util.Set.of("tenantId","productId","quantity") : java.util.Set.of("tenantId","productId"),params.keySet());
+        for (var item : params.entrySet()) {
+            var parameter=item.getValue();
+            assertTrue(parameter.path("required").asBoolean());
+            if (item.getKey().equals("quantity")) {
+                assertEquals("query",parameter.path("in").asText());
+                assertQuantity(parameter.path("schema"),"0.001");
+            } else {
+                assertEquals("path",parameter.path("in").asText());
+                assertPriceType(parameter.path("schema"),"string","uuid",false);
+            }
+        }
+        var responses = operation.path("responses");
+        var expected = new java.util.HashSet<>(java.util.Set.of(success,"400","401","404","500","503"));
+        if (conflict) expected.add("409");
+        assertEquals(expected, fields(responses));
+        for (String code : expected) {
+            var content=responses.path(code).path("content");
+            if (code.equals("204")) {
+                assertFalse(responses.path(code).has("content"));
+            } else if (code.equals("200")) {
+                assertEquals(java.util.Set.of("application/json"), fields(content));
+            } else {
+                assertEquals(java.util.Set.of("application/problem+json"), fields(content));
+                var error=priceSchema(document,content.path("application/problem+json").path("schema"));
+                assertFields(error,"type","title","status","detail","instance","correlationId");
+                assertPriceType(error.path("properties").path("type"),"string","uri-reference",false);
+                assertPriceType(error.path("properties").path("title"),"string","",false);
+                assertPriceType(error.path("properties").path("status"),"integer","int32",false);
+                assertPriceType(error.path("properties").path("detail"),"string","",false);
+                assertPriceType(error.path("properties").path("instance"),"string","uri-reference",true);
+                assertPriceType(error.path("properties").path("correlationId"),"string","uuid",false);
+            }
+        }
+        if (method.equals("put")) {
+            assertTrue(operation.path("requestBody").path("required").asBoolean());
+            assertEquals(java.util.Set.of("application/json"),fields(operation.path("requestBody").path("content")));
+        } else assertFalse(operation.has("requestBody"));
+    }
+
+    private static java.util.Set<String> fields(com.fasterxml.jackson.databind.JsonNode node) {
+        var result=new java.util.HashSet<String>();
+        node.fieldNames().forEachRemaining(result::add);
+        return result;
+    }
+
+    private static com.fasterxml.jackson.databind.JsonNode priceSchema(com.fasterxml.jackson.databind.JsonNode document,
+            com.fasterxml.jackson.databind.JsonNode node) {
+        var seen=new java.util.HashSet<String>();
+        while (node.has("$ref")) {
+            String ref=node.path("$ref").asText();
+            assertTrue(ref.startsWith("#/") && seen.add(ref),ref);
+            node=document.at(ref.substring(1));
+        }
+        assertTrue(node.isObject(),node.toString());
+        return node;
+    }
+
+    private static void assertFields(com.fasterxml.jackson.databind.JsonNode schema,String... names) {
+        assertPriceType(schema,"object","",false);
+        assertEquals(java.util.Set.of(names),fields(schema.path("properties")));
+        var required=new java.util.HashSet<String>();
+        schema.path("required").forEach(field -> required.add(field.asText()));
+        assertEquals(java.util.Set.of(names), required);
+    }
+
+    private static com.fasterxml.jackson.databind.JsonNode nullableOpenApiObject(
+            com.fasterxml.jackson.databind.JsonNode document,com.fasterxml.jackson.databind.JsonNode property) {
+        var alternatives=property.path("anyOf");
+        if (alternatives.isMissingNode()) alternatives=property.path("oneOf");
+        assertEquals(2,alternatives.size(),property.toString());
+        boolean allowsNull=false;
+        com.fasterxml.jackson.databind.JsonNode object=null;
+        for (var option:alternatives) {
+            if(option.path("type").asText().equals("null")) allowsNull=true;
+            else object=priceSchema(document,option);
+        }
+        assertTrue(allowsNull,property.toString());
+        assertNotNull(object,property.toString());
+        return object;
+    }
+
+    private static void assertPriceType(com.fasterxml.jackson.databind.JsonNode schema,String type,String format,boolean nullable) {
+        var types=new java.util.HashSet<String>();
+        if(schema.path("type").isArray())schema.path("type").forEach(value -> types.add(value.asText()));
+        else types.add(schema.path("type").asText());
+        if(schema.path("nullable").asBoolean())types.add("null");
+        assertEquals(nullable?java.util.Set.of(type,"null"):java.util.Set.of(type),types,schema.toString());
+        assertEquals(format,schema.path("format").asText(),schema.toString());
+    }
+
+    private static void assertNumber(com.fasterxml.jackson.databind.JsonNode schema,String key,String value) {
+        assertTrue(schema.path(key).isNumber(),schema.toString());
+        assertEquals(0,new java.math.BigDecimal(value).compareTo(schema.path(key).decimalValue()),schema.toString());
+    }
+
+    private static void assertMoney(com.fasterxml.jackson.databind.JsonNode schema,boolean nullable) {
+        assertPriceType(schema,"number","",nullable);
+        assertNumber(schema,"minimum","0");
+        assertNumber(schema,"exclusiveMaximum","10000000000000000");
+        assertNumber(schema,"multipleOf","0.01");
+    }
+
+    private static void assertVersion(com.fasterxml.jackson.databind.JsonNode schema) {
+        assertPriceType(schema,"integer","int64",false);
+        assertNumber(schema,"minimum","0");
+    }
+
+    private static void assertQuantity(com.fasterxml.jackson.databind.JsonNode schema,String minimum) {
+        assertPriceType(schema,"number","",false);
+        assertNumber(schema,"minimum",minimum);
+        assertNumber(schema,"exclusiveMaximum","1000000000000000");
+        assertNumber(schema,"multipleOf","0.001");
+    }
+
+    private static void assertPriceTiers(com.fasterxml.jackson.databind.JsonNode document,com.fasterxml.jackson.databind.JsonNode schema,String lowerBound) {
+        assertPriceType(schema,"array","",false);
+        var tier=priceSchema(document,schema.path("items"));
+        assertFields(tier,"minimumQuantity","unitPrice");
+        assertEquals(com.fasterxml.jackson.databind.node.BooleanNode.FALSE,tier.path("additionalProperties"));
+        var minimum=tier.path("properties").path("minimumQuantity");
+        assertQuantity(minimum,lowerBound);
+        assertMoney(tier.path("properties").path("unitPrice"),false);
     }
 
     @Test
@@ -717,6 +1410,24 @@ class OidcPlatformAuthorizationTest {
         given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"categoryId",inactive)).patch(base+"/"+id).then().statusCode(409);
         UUID tenantId=UUID.fromString(tenant),productId=UUID.fromString(id);
         assertEquals(1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_UPDATED'",tenantId,productId));
+        String publicationProduct=given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("categoryId",category,"sku","PUBLICATION-EDIT","name","Antes"))
+                .post(base).then().statusCode(201).extract().path("productId");
+        UUID publicationId=UUID.fromString(publicationProduct);
+        try(var connection=dataSource.getConnection();var update=connection.prepareStatement(
+                "UPDATE product SET status='ACTIVE',published=true,ever_published=true WHERE tenant_id=? AND product_id=?")) {
+            update.setObject(1,tenantId);update.setObject(2,publicationId);assertEquals(1,update.executeUpdate());
+        }
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",0,"name","Publicado editado"))
+                .patch(base+"/"+publicationProduct).then().statusCode(200).body("name",is("Publicado editado")).body("version",is(1));
+        assertEquals(1,sqlCount("SELECT count(*) FROM product WHERE tenant_id=? AND product_id=? AND name='Publicado editado' AND version=1 AND status='ACTIVE' AND published AND ever_published",tenantId,publicationId));
+        try(var connection=dataSource.getConnection();var update=connection.prepareStatement(
+                "UPDATE product SET published=false WHERE tenant_id=? AND product_id=?")) {
+            update.setObject(1,tenantId);update.setObject(2,publicationId);assertEquals(1,update.executeUpdate());
+        }
+        given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"name","Oculto editado"))
+                .patch(base+"/"+publicationProduct).then().statusCode(200).body("name",is("Oculto editado")).body("version",is(2));
+        assertEquals(1,sqlCount("SELECT count(*) FROM product WHERE tenant_id=? AND product_id=? AND name='Oculto editado' AND version=2 AND status='ACTIVE' AND NOT published AND ever_published",tenantId,publicationId));
         String suffix=UUID.randomUUID().toString().replace("-","");String function="product_fail_"+suffix,trigger="product_trigger_"+suffix;
         try {
             try(var c=dataSource.getConnection();var st=c.createStatement()){
@@ -743,6 +1454,242 @@ class OidcPlatformAuthorizationTest {
         given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",1,"name","Archivado")).patch(base+"/"+id).then().statusCode(409);
         try(var c=dataSource.getConnection();var q=c.prepareStatement("UPDATE tenant SET status='SUSPENDED' WHERE tenant_id=?")){q.setObject(1,tenantId);q.executeUpdate();}
         given().auth().oauth2(admin).get(base).then().statusCode(404);
+    }
+
+    @Test
+    void variantsHaveIndependentPricesAndScopedProductManagement() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        UUID account=provision(admin);
+        var setup=new java.util.HashMap<String,Object>(java.util.Map.of(
+                "slug","variants-"+UUID.randomUUID(),"legalName","Legal","displayName","Catalog",
+                "timeZone","UTC","initialAdministratorAccountId",account.toString(),
+                "commercialProfiles",java.util.List.of("CATALOG_MANAGER","PRICE_MANAGER")));
+        String tenant=given().auth().oauth2(admin).contentType("application/json").body(setup)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        setup.put("slug","variants-other-"+UUID.randomUUID());
+        String otherTenant=given().auth().oauth2(admin).contentType("application/json").body(setup)
+                .post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        UUID tenantId=UUID.fromString(tenant);
+        try(var c=dataSource.getConnection();var statement=c.prepareStatement("""
+                INSERT INTO role_permission(tenant_id,role_id,permission_code)
+                SELECT tenant_id,role_id,p.code FROM app_role
+                CROSS JOIN (VALUES ('PRODUCT_PRICE_TIER_READ'),('PRODUCT_COST_READ'),('PRODUCT_COST_UPDATE')) p(code)
+                WHERE tenant_id=? AND app_role.code='PRICE_MANAGER'
+                """)) {
+            statement.setObject(1,tenantId);
+            assertEquals(3,statement.executeUpdate());
+        }
+        String base="/api/v1/tenants/"+tenant, otherBase="/api/v1/tenants/"+otherTenant;
+        String category=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","H","name","Helmets"))
+                .post(base+"/categories").then().statusCode(201).extract().path("categoryId");
+        String otherCategory=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","H","name","Helmets"))
+                .post(otherBase+"/categories").then().statusCode(201).extract().path("categoryId");
+        var groupRequest=java.util.Map.of("type","VARIABLE","categoryId",category,"name","Casco");
+        String group=given().auth().oauth2(admin).contentType("application/json").body(groupRequest)
+                .post(base+"/products").then().statusCode(201).body("sku",is(org.hamcrest.Matchers.nullValue()))
+                .body("type",is("VARIABLE")).extract().path("productId");
+        var variantRequest=new java.util.HashMap<String,Object>(java.util.Map.of(
+                "type","VARIANT","parentId",group,"categoryId",category,"sku","CASCO-S","name","Casco S",
+                "attributes",java.util.Map.of("color","negro","size","S")));
+        String first=given().auth().oauth2(admin).contentType("application/json").body(variantRequest)
+                .post(base+"/products").then().statusCode(201).body("parentId",is(group)).body("attributes.size",is("S"))
+                .extract().path("productId");
+        variantRequest.put("sku","CASCO-M");
+        given().auth().oauth2(admin).contentType("application/json").body(variantRequest)
+                .post(base+"/products").then().statusCode(409);
+        variantRequest.put("name","Casco M");
+        variantRequest.put("attributes",java.util.Map.of("color","negro","size","M"));
+        String second=given().auth().oauth2(admin).contentType("application/json").body(variantRequest)
+                .post(base+"/products").then().statusCode(201).extract().path("productId");
+        given().auth().oauth2(admin).queryParam("type","VARIANT").queryParam("parentId",group).queryParam("sku","casco-m")
+                .get(base+"/products").then().statusCode(200).body("items.productId",is(java.util.List.of(second)));
+        given().auth().oauth2(admin).get(otherBase+"/products/"+first).then().statusCode(404);
+        var foreignRequest=new java.util.HashMap<>(variantRequest);
+        foreignRequest.put("categoryId",otherCategory);
+        given().auth().oauth2(admin).contentType("application/json").body(foreignRequest)
+                .post(otherBase+"/products").then().statusCode(404);
+        variantRequest.put("sku","CASCO-NESTED");
+        variantRequest.put("parentId",first);
+        given().auth().oauth2(admin).contentType("application/json").body(variantRequest)
+                .post(base+"/products").then().statusCode(409);
+
+        String firstPath=base+"/products/"+first,secondPath=base+"/products/"+second;
+        given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("version",0,"attributes",java.util.Map.of("color","negro","size","M")))
+                .patch(firstPath).then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("version",0,"attributes",java.util.Map.of("color","blanco","size","S")))
+                .patch(firstPath).then().statusCode(200).body("version",is(1)).body("attributes.color",is("blanco"));
+        given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("version",0,"attributes",java.util.Map.of("color","rojo","size","S")))
+                .patch(firstPath).then().statusCode(409);
+        for (var path:java.util.List.of(firstPath,secondPath)) {
+            int price=path.equals(firstPath)?12:20;
+            int version=path.equals(firstPath)?1:0;
+            given().auth().oauth2(admin).contentType("application/json")
+                    .body(java.util.Map.of("version",version,"retailPrice",price,"tiers",
+                            java.util.List.of(java.util.Map.of("minimumQuantity",6,"unitPrice",price-2))))
+                    .put(path+"/prices/sale").then().statusCode(204);
+            given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("version",version+1,"cost",price-5))
+                    .put(path+"/prices/cost").then().statusCode(204);
+            given().auth().oauth2(admin).get(path+"/prices/quote?quantity=6").then().statusCode(200)
+                    .body("unitPrice",is((float)price-2)).body("quantity",is(6));
+            given().auth().oauth2(admin).get(path+"/prices/cost").then().statusCode(200).body("cost",is((float)price-5));
+        }
+        given().auth().oauth2(admin).get(base+"/products/"+group+"/prices").then().statusCode(404);
+        given().auth().oauth2(admin).contentType("application/json")
+                .body(java.util.Map.of("version",0,"retailPrice",1,"tiers",java.util.List.of()))
+                .put(base+"/products/"+group+"/prices/sale").then().statusCode(404);
+        assertEquals(1,sqlCount("""
+                SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_UPDATED'
+                    AND before_data->'attributes'->>'color'='negro' AND after_data->'attributes'->>'color'='blanco'
+                """,tenantId,UUID.fromString(first)));
+    }
+
+    @Test
+    void productPricesUseTenantAuthorizationAndVersion() throws Exception {
+        String admin=token(KeycloakRealmResource.ADMIN,"commercecore-api");
+        UUID account=provision(admin);
+        var setup=java.util.Map.of("slug","prices-"+UUID.randomUUID(),"legalName","Legal","displayName","Empresa",
+                "currencyCode","PEN","timeZone","UTC","initialAdministratorAccountId",account.toString(),
+                "commercialProfiles",java.util.List.of("CATALOG_MANAGER","PRICE_MANAGER"));
+        String tenant=given().auth().oauth2(admin).contentType("application/json").body(setup).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("INSERT INTO role_permission(tenant_id,role_id,permission_code) SELECT tenant_id,role_id,p.code FROM app_role CROSS JOIN (VALUES ('PRODUCT_PRICE_TIER_READ'),('PRODUCT_COST_READ'),('PRODUCT_COST_UPDATE')) AS p(code) WHERE tenant_id=? AND app_role.code='PRICE_MANAGER'")){
+            s.setObject(1,UUID.fromString(tenant));s.executeUpdate();
+        }
+        String base="/api/v1/tenants/"+tenant;
+        String category=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("code","P","name","Precios")).post(base+"/categories").then().statusCode(201).extract().path("categoryId");
+        String product=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",category,"sku","PRICES","name","Producto")).post(base+"/products").then().statusCode(201).extract().path("productId");
+        String path=base+"/products/"+product+"/prices";
+        String other=token(KeycloakRealmResource.OTHER,"commercecore-api");UUID otherAccount=provision(other);
+        var otherSetup=new java.util.HashMap<>(setup);otherSetup.put("slug","other-prices-"+UUID.randomUUID());otherSetup.put("initialAdministratorAccountId",otherAccount.toString());
+        String otherTenant=given().auth().oauth2(admin).contentType("application/json").body(otherSetup).post("/api/v1/platform/tenants").then().statusCode(201).extract().path("tenantId");
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("INSERT INTO role_permission(tenant_id,role_id,permission_code) SELECT tenant_id,role_id,p.code FROM app_role CROSS JOIN (VALUES ('PRODUCT_PRICE_TIER_READ'),('PRODUCT_COST_READ')) p(code) WHERE tenant_id=? AND app_role.code='PRICE_MANAGER'")){s.setObject(1,UUID.fromString(otherTenant));s.executeUpdate();}
+        String foreignPath="/api/v1/tenants/"+otherTenant+"/products/"+product+"/prices";
+        for(String suffix:java.util.List.of("/cost","/tiers","/quote?quantity=6")){
+            var denied=given().auth().oauth2(other).get(path+suffix).then().statusCode(404).extract().response();
+            assertFalse(denied.asString().contains("3.25"));given().auth().oauth2(other).get(foreignPath+suffix).then().statusCode(404);
+        }
+        given().auth().oauth2(other).contentType("application/json").body("{\"version\":0,\"retailPrice\":4,\"tiers\":[]}").put(path+"/sale").then().statusCode(404);
+        given().auth().oauth2(other).contentType("application/json").body("{\"version\":0,\"cost\":4}").put(foreignPath+"/cost").then().statusCode(404);
+        given().auth().oauth2(admin).get(path).then().statusCode(200).body("configured",is(false));
+        given().auth().oauth2(admin).queryParam("quantity",1).get(path+"/quote").then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":0,\"retailPrice\":12.00,\"tiers\":[{\"minimumQuantity\":6,\"unitPrice\":10.00}]}").put(path+"/sale").then().statusCode(204);
+        given().auth().oauth2(admin).queryParam("quantity",6).get(path+"/quote").then().statusCode(200).body("unitPrice",is(10.0f));
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":0,\"retailPrice\":9,\"tiers\":[]}").put(path+"/sale").then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":1,\"cost\":1.001}").put(path+"/cost").then().statusCode(400);
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":1,\"cost\":3.25}").put(path+"/cost").then().statusCode(204);
+        given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200).body("cost",is(3.25f));
+        var hiddenCost=given().auth().oauth2(other).get(path+"/cost").then().statusCode(404).contentType("application/problem+json").extract().asString();
+        assertFalse(hiddenCost.contains("3.25"));assertFalse(hiddenCost.contains("SQLException"));assertFalse(hiddenCost.contains("SELECT"));
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":2,\"retailPrice\":12.00,\"tiers\":[{\"minimumQuantity\":101,\"unitPrice\":6},{\"minimumQuantity\":6,\"unitPrice\":10},{\"minimumQuantity\":50,\"unitPrice\":7},{\"minimumQuantity\":20,\"unitPrice\":8}]}").put(path+"/sale").then().statusCode(204);
+        int[] quantities={1,5,6,19,20,49,50,100,101}; int[] values={12,12,10,10,8,8,7,7,6};
+        for(int i=0;i<quantities.length;i++){
+            var response=given().auth().oauth2(admin).queryParam("quantity",quantities[i]).get(path+"/quote").then().statusCode(200).extract().response();
+            var unit=new java.math.BigDecimal(response.jsonPath().get("unitPrice").toString());
+            assertEquals(0,unit.compareTo(java.math.BigDecimal.valueOf(values[i])));
+            assertEquals(0,unit.multiply(java.math.BigDecimal.valueOf(quantities[i])).compareTo(java.math.BigDecimal.valueOf((long)values[i]*quantities[i])));
+        }
+        for(int quantity:new int[]{0,-1})given().auth().oauth2(admin).queryParam("quantity",quantity).get(path+"/quote").then().statusCode(400);
+        for(String bad:java.util.List.of("{\"version\":3,\"retailPrice\":-1,\"tiers\":[]}","{\"version\":3,\"retailPrice\":1.001,\"tiers\":[]}","{\"version\":3,\"retailPrice\":12,\"tiers\":[{\"minimumQuantity\":6,\"unitPrice\":10},{\"minimumQuantity\":6,\"unitPrice\":9}]}"))
+            given().auth().oauth2(admin).contentType("application/json").body(bad).put(path+"/sale").then().statusCode(400);
+        var gate=new java.util.concurrent.CountDownLatch(1);var pool=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.concurrent.Callable<Integer> first=()->{gate.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":3,\"retailPrice\":0,\"tiers\":[]}").put(path+"/sale").statusCode();};
+            java.util.concurrent.Callable<Integer> second=()->{gate.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":3,\"retailPrice\":0,\"tiers\":[]}").put(path+"/sale").statusCode();};
+            var a=pool.submit(first);var b=pool.submit(second);gate.countDown();assertEquals(java.util.Set.of(204,409),java.util.Set.of(a.get(),b.get()));
+        } finally {pool.shutdownNow();}
+        given().auth().oauth2(admin).get(path).then().statusCode(200).body("configured",is(true)).body("version",is(4));
+        given().auth().oauth2(admin).get(path+"/tiers").then().statusCode(200).body("size()",is(0));
+        var zero=given().auth().oauth2(admin).queryParam("quantity",101).get(path+"/quote").then().statusCode(200).extract().path("unitPrice");
+        assertEquals(0,new java.math.BigDecimal(zero.toString()).signum());
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":4,\"cost\":null}").put(path+"/cost").then().statusCode(204);
+        given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200).body("cost",org.hamcrest.Matchers.nullValue());
+        var latch=new java.util.concurrent.CountDownLatch(1);var runners=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var writer=runners.submit(()->{latch.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":5,\"retailPrice\":8,\"tiers\":[{\"minimumQuantity\":6,\"unitPrice\":7}]}").put(path+"/sale").statusCode();});
+            var reader=runners.submit(()->{latch.await();return given().auth().oauth2(admin).queryParam("quantity",6).get(path+"/quote").then().statusCode(200).extract().path("unitPrice");});
+            latch.countDown();assertEquals(204,writer.get());var observed=new java.math.BigDecimal(reader.get().toString());
+            assertTrue(observed.compareTo(java.math.BigDecimal.ZERO)==0 || observed.compareTo(java.math.BigDecimal.valueOf(7))==0);
+        } finally {runners.shutdownNow();}
+        String suffix=UUID.randomUUID().toString().replace("-","");String function="price_audit_fail_"+suffix,trigger="price_audit_trigger_"+suffix;
+        try {
+            try(var c=dataSource.getConnection();var s=c.createStatement()){
+                s.execute("CREATE FUNCTION "+function+"() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.tenant_id='"+tenant+"' AND NEW.action IN ('PRODUCT_SALE_PRICES_UPDATED','PRODUCT_COST_UPDATED') THEN RAISE EXCEPTION 'audit test failure'; END IF; RETURN NEW; END $$");
+                s.execute("CREATE TRIGGER "+trigger+" BEFORE INSERT ON audit_event FOR EACH ROW EXECUTE FUNCTION "+function+"()");
+            }
+            given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"retailPrice\":4,\"tiers\":[]}").put(path+"/sale").then().statusCode(500);
+            given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"cost\":99}").put(path+"/cost").then().statusCode(500);
+            given().auth().oauth2(admin).get(path).then().statusCode(200).body("version",is(6)).body("retailPrice",is(8.0f));
+            given().auth().oauth2(admin).get(path+"/tiers").then().statusCode(200).body("size()",is(1));
+            given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200).body("cost",org.hamcrest.Matchers.nullValue());
+            given().auth().oauth2(admin).queryParam("quantity",6).get(path+"/quote").then().statusCode(200).body("unitPrice",is(7.0f));
+        } finally {try(var c=dataSource.getConnection();var s=c.createStatement()){s.execute("DROP TRIGGER IF EXISTS "+trigger+" ON audit_event");s.execute("DROP FUNCTION IF EXISTS "+function+"()");}}
+        int auditBefore=sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_SALE_PRICES_UPDATED'",UUID.fromString(tenant),UUID.fromString(product));
+        var startDistinct=new java.util.concurrent.CountDownLatch(1);var writers=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var a=writers.submit(()->{startDistinct.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"retailPrice\":30,\"tiers\":[{\"minimumQuantity\":4,\"unitPrice\":20}]}").put(path+"/sale").statusCode();});
+            var b=writers.submit(()->{startDistinct.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"retailPrice\":40,\"tiers\":[{\"minimumQuantity\":9,\"unitPrice\":15},{\"minimumQuantity\":12,\"unitPrice\":10}]}").put(path+"/sale").statusCode();});
+            startDistinct.countDown();int first=a.get(),second=b.get();assertEquals(java.util.Set.of(204,409),java.util.Set.of(first,second));
+            var sale=given().auth().oauth2(admin).get(path).then().statusCode(200).body("version",is(7)).extract().response();
+            var tiers=given().auth().oauth2(admin).get(path+"/tiers").then().statusCode(200).extract().response();
+            if(first==204){assertEquals(0,new java.math.BigDecimal(sale.jsonPath().get("retailPrice").toString()).compareTo(new java.math.BigDecimal("30")));assertEquals(1,tiers.jsonPath().getList("").size());assertEquals(4,((Number)tiers.jsonPath().get("[0].minimumQuantity")).intValue());}
+            else {assertEquals(0,new java.math.BigDecimal(sale.jsonPath().get("retailPrice").toString()).compareTo(new java.math.BigDecimal("40")));assertEquals(2,tiers.jsonPath().getList("").size());assertEquals(9,((Number)tiers.jsonPath().get("[0].minimumQuantity")).intValue());assertEquals(12,((Number)tiers.jsonPath().get("[1].minimumQuantity")).intValue());}
+            assertEquals(0,new java.math.BigDecimal(tiers.jsonPath().get("[0].unitPrice").toString()).compareTo(new java.math.BigDecimal(first==204?"20":"15")));
+            if(second==204)assertEquals(0,new java.math.BigDecimal(tiers.jsonPath().get("[1].unitPrice").toString()).compareTo(new java.math.BigDecimal("10")));
+            assertEquals(auditBefore+1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action='PRODUCT_SALE_PRICES_UPDATED'",UUID.fromString(tenant),UUID.fromString(product)));
+        } finally {writers.shutdownNow();}
+        var beforeSale=given().auth().oauth2(admin).get(path).then().statusCode(200).extract().response();
+        var beforeTiers=given().auth().oauth2(admin).get(path+"/tiers").then().statusCode(200).extract().asString();
+        var beforeCost=given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200).extract().response();
+        int countBefore=sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action IN ('PRODUCT_SALE_PRICES_UPDATED','PRODUCT_COST_UPDATED')",UUID.fromString(tenant),UUID.fromString(product));
+        var gateBoth=new java.util.concurrent.CountDownLatch(1);var both=java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var saleWrite=both.submit(()->{gateBoth.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":7,\"retailPrice\":50,\"tiers\":[{\"minimumQuantity\":5,\"unitPrice\":25}]}").put(path+"/sale").statusCode();});
+            var costWrite=both.submit(()->{gateBoth.await();return given().auth().oauth2(admin).contentType("application/json").body("{\"version\":7,\"cost\":17}").put(path+"/cost").statusCode();});
+            gateBoth.countDown();int saleResult=saleWrite.get(),costResult=costWrite.get();assertEquals(java.util.Set.of(204,409),java.util.Set.of(saleResult,costResult));
+            var afterSale=given().auth().oauth2(admin).get(path).then().statusCode(200).body("version",is(8)).extract().response();
+            var afterCost=given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200).extract().response();
+            var afterTiers=given().auth().oauth2(admin).get(path+"/tiers").then().statusCode(200).extract().asString();
+            if(saleResult==204){assertEquals(0,new java.math.BigDecimal(afterSale.jsonPath().get("retailPrice").toString()).compareTo(new java.math.BigDecimal("50")));assertEquals((Object)beforeCost.jsonPath().get("cost"),(Object)afterCost.jsonPath().get("cost"));assertTrue(afterTiers.contains("25"));}
+            else {assertEquals((Object)beforeSale.jsonPath().get("retailPrice"),(Object)afterSale.jsonPath().get("retailPrice"));assertEquals(beforeTiers,afterTiers);assertEquals(0,new java.math.BigDecimal(afterCost.jsonPath().get("cost").toString()).compareTo(new java.math.BigDecimal("17")));}
+            assertEquals(countBefore+1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action IN ('PRODUCT_SALE_PRICES_UPDATED','PRODUCT_COST_UPDATED')",UUID.fromString(tenant),UUID.fromString(product)));
+            assertEquals(1,sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND action=? AND (after_data ->> ?)::numeric = ?",UUID.fromString(tenant),UUID.fromString(product),saleResult==204?"PRODUCT_SALE_PRICES_UPDATED":"PRODUCT_COST_UPDATED",saleResult==204?"retailPrice":"cost",new java.math.BigDecimal(saleResult==204?"50":"17")));
+        } finally {both.shutdownNow();}
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE product SET status='ARCHIVED' WHERE tenant_id=? AND product_id=?")){
+            s.setObject(1,UUID.fromString(tenant));s.setObject(2,UUID.fromString(product));s.executeUpdate();
+        }
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"cost\":1}").put(path+"/cost").then().statusCode(409);
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":6,\"retailPrice\":1,\"tiers\":[]}").put(path+"/sale").then().statusCode(409);
+        UUID tenantId=UUID.fromString(tenant);
+        String matrixProduct=given().auth().oauth2(admin).contentType("application/json").body(java.util.Map.of("categoryId",category,"sku","PERMISSION-MATRIX","name","Matrix")).post(base+"/products").then().statusCode(201).extract().path("productId");
+        String matrixPath=base+"/products/"+matrixProduct+"/prices";
+        given().auth().oauth2(admin).contentType("application/json").body("{\"version\":0,\"retailPrice\":12,\"tiers\":[]}").put(matrixPath+"/sale").then().statusCode(204);
+        long matrixVersion=1;
+        String[] permissions={"PRODUCT_READ","PRODUCT_PRICE_TIER_READ","PRODUCT_COST_READ","PRODUCT_PRICE_UPDATE","PRODUCT_COST_UPDATE"};
+        for(String permission:permissions){
+            try(var c=dataSource.getConnection()){
+                try(var d=c.prepareStatement("DELETE FROM role_permission WHERE tenant_id=? AND role_id IN (SELECT role_id FROM app_role WHERE tenant_id=? AND code IN ('PRICE_MANAGER','CATALOG_MANAGER')) AND permission_code IN ('PRODUCT_READ','PRODUCT_PRICE_TIER_READ','PRODUCT_COST_READ','PRODUCT_PRICE_UPDATE','PRODUCT_COST_UPDATE')")){d.setObject(1,tenantId);d.setObject(2,tenantId);d.executeUpdate();}
+                try(var s=c.prepareStatement("INSERT INTO role_permission(tenant_id,role_id,permission_code) SELECT tenant_id,role_id,? FROM app_role WHERE tenant_id=? AND code='PRICE_MANAGER'")){s.setString(1,permission);s.setObject(2,tenantId);s.executeUpdate();}
+            }
+            given().auth().oauth2(admin).get(matrixPath).then().statusCode(permission.equals("PRODUCT_READ")?200:404);
+            given().auth().oauth2(admin).get(matrixPath+"/tiers").then().statusCode(permission.equals("PRODUCT_PRICE_TIER_READ")?200:404);
+            given().auth().oauth2(admin).queryParam("quantity",1).get(matrixPath+"/quote").then().statusCode(permission.equals("PRODUCT_PRICE_TIER_READ")?200:404);
+            given().auth().oauth2(admin).get(matrixPath+"/cost").then().statusCode(permission.equals("PRODUCT_COST_READ")?200:404);
+            given().auth().oauth2(admin).contentType("application/json").body("{\"version\":"+matrixVersion+",\"retailPrice\":1,\"tiers\":[]}").put(matrixPath+"/sale").then().statusCode(permission.equals("PRODUCT_PRICE_UPDATE")?204:404);
+            if(permission.equals("PRODUCT_PRICE_UPDATE"))matrixVersion++;
+            given().auth().oauth2(admin).contentType("application/json").body("{\"version\":"+matrixVersion+",\"cost\":1}").put(matrixPath+"/cost").then().statusCode(permission.equals("PRODUCT_COST_UPDATE")?204:404);
+            if(permission.equals("PRODUCT_COST_UPDATE"))matrixVersion++;
+        }
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE role_permission SET permission_code='PRODUCT_COST_READ' WHERE tenant_id=? AND permission_code='PRODUCT_COST_UPDATE'")){s.setObject(1,tenantId);s.executeUpdate();}
+        given().auth().oauth2(admin).get(path+"/cost").then().statusCode(200);
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE user_account SET status='DISABLED' WHERE user_id=?")){s.setObject(1,account);s.executeUpdate();}
+        try {given().auth().oauth2(admin).get(path+"/cost").then().statusCode(404);}
+        finally {try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE user_account SET status='ACTIVE' WHERE user_id=?")){s.setObject(1,account);s.executeUpdate();}}
+        try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE tenant_membership SET status='SUSPENDED' WHERE tenant_id=? AND user_id=?")){s.setObject(1,tenantId);s.setObject(2,account);s.executeUpdate();}
+        try {given().auth().oauth2(admin).get(path+"/cost").then().statusCode(404);}
+        finally {try(var c=dataSource.getConnection();var s=c.prepareStatement("UPDATE tenant_membership SET status='ACTIVE' WHERE tenant_id=? AND user_id=?")){s.setObject(1,tenantId);s.setObject(2,account);s.executeUpdate();}}
+        given().get(path).then().statusCode(401);
     }
 
     @Test

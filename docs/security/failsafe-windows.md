@@ -24,3 +24,7 @@ Incidencia independiente de Identity: reproducir con instrumentación de salida
 del proceso y comparar el cierre controlado con una parada normal, sin registrar
 tokens ni credenciales. Mantener Failsafe activo y no interpretar por sí solo el
 mensaje como una prueba de fallo funcional o de cierre limpio.
+
+## Comprobación durante el maestro A.4
+
+Se confirmó que el XML de `SprintOnePackagedIT` de la regresión anterior contiene el mensaje de salida después de la prueba y que el bytecode de Quarkus 3.40.1.1 termina el proceso hijo. Un experimento local en Windows del 17/11/2026 creó un proceso Java hijo que notificó estar listo y permaneció bloqueado esperando entrada. Una llamada a `Process.destroy()` produjo `PROCESS_EXIT_AFTER_DESTROY=1`. El experimento aislado reproduce ese código sin ejecutar CommerceCore ni iniciar servicios. Demuestra el mecanismo de terminación posible. Falta instrumentar el cierre del proceso hijo de Quarkus para confirmar la ruta exacta y el impacto en la liberación ordenada de recursos. La incidencia sigue abierta y no se cambió la configuración de Failsafe.

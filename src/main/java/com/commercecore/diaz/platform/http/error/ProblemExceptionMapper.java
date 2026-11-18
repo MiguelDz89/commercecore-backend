@@ -4,6 +4,7 @@ import com.commercecore.diaz.tenant.application.DuplicateTenantSlugException;
 import com.commercecore.diaz.identity.application.MembershipConflictException;
 import com.commercecore.diaz.catalog.application.CategoryConflictException;
 import com.commercecore.diaz.catalog.application.ProductConflictException;
+import com.commercecore.diaz.catalog.application.ProductStatusConflictException;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Context;
@@ -34,10 +35,28 @@ public class ProblemExceptionMapper implements ExceptionMapper<Exception> {
             case 503 -> "Una dependencia no está disponible temporalmente."; default -> "No se pudo completar la operación."; };
         var problem=new ProblemDetails("about:blank",title,status,detail,
                 uri==null ? null : (uri.getPath().startsWith("/") ? uri.getPath() : "/"+uri.getPath()),UUID.randomUUID().toString());
+        if (status == 409) {
+            var conflict = statusConflict(exception);
+            if (conflict != null) {
+                var conflicts = conflict.conflicts().stream()
+                        .map(item -> new ProductStatusConflictProblem.Conflict(item.productId(), item.code(), item.variantId()))
+                        .toList();
+                return Response.status(status).type("application/problem+json")
+                        .entity(new ProductStatusConflictProblem(problem, conflicts)).build();
+            }
+        }
         return Response.status(status).type("application/problem+json").entity(problem).build();
     }
+
+    private static ProductStatusConflictException statusConflict(Throwable error) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = error; cause != null && seen.add(cause); cause = cause.getCause()) {
+            if (cause instanceof ProductStatusConflictException conflict) return conflict;
+        }
+        return null;
+    }
     private boolean isMembershipRequest() {
-        return uri!=null && uri.getPath().matches("/?api/v1/tenants/[^/]+/(?:memberships|roles|categories|products)(?:/.*)?");
+        return uri!=null && uri.getPath().matches("/?api/v1/tenants/[^/]+/(?:memberships|roles|categories|products|exchange-rates)(?:/.*)?");
     }
     private int classify(Throwable error) {
         Set<Throwable> seen=Collections.newSetFromMap(new IdentityHashMap<>());

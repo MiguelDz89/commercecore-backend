@@ -10,7 +10,7 @@ import java.util.regex.Pattern;
 
 public record Tenant(UUID tenantId, String slug, String legalName, String displayName,
                      String currencyCode, String timeZone, TenantStatus status,
-                     Instant createdAt, Instant updatedAt) {
+                     Instant createdAt, Instant updatedAt, boolean fractionalQuantitiesEnabled) {
     private static final Pattern SLUG = Pattern.compile("[a-z0-9]+(?:-[a-z0-9]+)*");
     private static final Pattern CURRENCY = Pattern.compile("[A-Z]{3}");
 
@@ -37,10 +37,20 @@ public record Tenant(UUID tenantId, String slug, String legalName, String displa
         }
     }
 
+    public Tenant(UUID tenantId, String slug, String legalName, String displayName, String currencyCode,
+                  String timeZone, TenantStatus status, Instant createdAt, Instant updatedAt) {
+        this(tenantId, slug, legalName, displayName, currencyCode, timeZone, status, createdAt, updatedAt, false);
+    }
+
     public static Tenant create(String slug, String legalName, String displayName, String currencyCode, String timeZone) {
+        return create(slug, legalName, displayName, currencyCode, timeZone, false);
+    }
+
+    public static Tenant create(String slug, String legalName, String displayName, String currencyCode, String timeZone,
+                                boolean fractionalQuantitiesEnabled) {
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
         return new Tenant(UUID.randomUUID(), slug, legalName, displayName, currencyCode, timeZone,
-                TenantStatus.ACTIVE, now, now);
+                TenantStatus.ACTIVE, now, now, fractionalQuantitiesEnabled);
     }
 
     public Tenant suspend() {
@@ -56,7 +66,7 @@ public record Tenant(UUID tenantId, String slug, String legalName, String displa
             throw new IllegalStateException("Invalid tenant status transition");
         }
         return new Tenant(tenantId, slug, legalName, displayName, currencyCode, timeZone,
-                target, createdAt, Instant.now().truncatedTo(ChronoUnit.MICROS));
+                target, createdAt, Instant.now().truncatedTo(ChronoUnit.MICROS), fractionalQuantitiesEnabled);
     }
 
     private static void requireName(String name, int maxLength, String field) {

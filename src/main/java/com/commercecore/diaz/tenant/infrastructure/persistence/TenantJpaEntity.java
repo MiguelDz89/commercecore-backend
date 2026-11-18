@@ -37,6 +37,9 @@ public class TenantJpaEntity {
     @Column(name = "updated_at", nullable = false)
     Instant updatedAt;
 
+    @Column(name = "fractional_quantities_enabled", nullable = false)
+    boolean fractionalQuantitiesEnabled;
+
     protected TenantJpaEntity() {
     }
 }
