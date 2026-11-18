@@ -639,6 +639,87 @@ class OidcPlatformAuthorizationTest {
                 """, fixture.tenant(), foreign.tenant()));
     }
 
+    @Test
+    void enforcesStatusPermissionForRealCommercialActorsOnBothRoutes() throws Exception {
+        String admin = token(KeycloakRealmResource.ADMIN, "commercecore-api");
+        String commercial = token(KeycloakRealmResource.MEMBER, "commercecore-api");
+        String noMembership = token(KeycloakRealmResource.OTHER, "commercecore-api");
+        String wrongAudience = token(KeycloakRealmResource.MEMBER, "other-client");
+        UUID actor = provision(commercial);
+        provision(noMembership);
+        var fixture = statusFixture(admin);
+        String first = createStatusProduct(admin, fixture, java.util.Map.of("sku", "PERM-1", "name", "Uno"));
+        String second = createStatusProduct(admin, fixture, java.util.Map.of("sku", "PERM-2", "name", "Dos"));
+        String rejected = createStatusProduct(admin, fixture, java.util.Map.of("sku", "PERM-3", "name", "Tres"));
+        UUID member = UUID.randomUUID();
+        try {
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("INSERT INTO tenant_membership(membership_id,tenant_id,user_id,status) VALUES ('"
+                        + member + "','" + fixture.tenant() + "','" + actor + "','ACTIVE')");
+                statement.executeUpdate("INSERT INTO membership_role(tenant_id,membership_id,role_id) "
+                        + "SELECT tenant_id,'" + member + "',role_id FROM app_role WHERE tenant_id='"
+                        + fixture.tenant() + "' AND code='CATALOG_MANAGER'");
+            }
+            String singleCorrelation = given().auth().oauth2(commercial).contentType("application/json")
+                    .body("{\"target\":\"ACTIVE\",\"version\":0}")
+                    .patch(fixture.products() + "/" + first + "/status").then().statusCode(200)
+                    .extract().path("correlationId");
+            String batchCorrelation = given().auth().oauth2(commercial).contentType("application/json")
+                    .body("{\"target\":\"ACTIVE\",\"items\":[{\"productId\":\"" + second + "\",\"version\":0}]}")
+                    .post(fixture.products() + "/status-changes").then().statusCode(200)
+                    .extract().path("correlationId");
+            assertEquals(1, sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND actor_user_id=? AND correlation_id=? AND action='PRODUCT_STATUS_CHANGED' AND before_data->>'status'='DRAFT' AND after_data->>'status'='ACTIVE'", fixture.tenant(), UUID.fromString(first), actor, singleCorrelation));
+            assertEquals(1, sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND entity_id=? AND actor_user_id=? AND correlation_id=? AND action='PRODUCT_STATUS_CHANGED' AND before_data->>'status'='DRAFT' AND after_data->>'status'='ACTIVE'", fixture.tenant(), UUID.fromString(second), actor, batchCorrelation));
+
+            String before = productRows(fixture.tenant());
+            int auditBefore = sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND action='PRODUCT_STATUS_CHANGED'", fixture.tenant());
+            assertStatusDeniedBothRoutes(fixture, rejected, null, 401);
+            assertStatusDeniedBothRoutes(fixture, rejected, "invalid", 401);
+            assertStatusDeniedBothRoutes(fixture, rejected, wrongAudience, 401);
+            assertStatusDeniedBothRoutes(fixture, rejected, noMembership, 404);
+
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("DELETE FROM role_permission WHERE tenant_id='" + fixture.tenant()
+                        + "' AND permission_code='PRODUCT_STATUS_UPDATE'");
+            }
+            assertEquals(1, sqlCount("SELECT count(*) FROM role_permission p JOIN membership_role m ON p.tenant_id=m.tenant_id AND p.role_id=m.role_id WHERE m.tenant_id=? AND m.membership_id=? AND p.permission_code='PRODUCT_UPDATE'", fixture.tenant(), member));
+            assertStatusDeniedBothRoutes(fixture, rejected, commercial, 404);
+
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("INSERT INTO role_permission(tenant_id,role_id,permission_code) SELECT tenant_id,role_id,'PRODUCT_STATUS_UPDATE' FROM app_role WHERE tenant_id='" + fixture.tenant() + "' AND code='CATALOG_MANAGER'");
+                statement.executeUpdate("UPDATE user_account SET status='DISABLED' WHERE user_id='" + actor + "'");
+            }
+            assertStatusDeniedBothRoutes(fixture, rejected, commercial, 404);
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("UPDATE user_account SET status='ACTIVE' WHERE user_id='" + actor + "'");
+                statement.executeUpdate("UPDATE tenant_membership SET status='SUSPENDED' WHERE membership_id='" + member + "'");
+            }
+            assertStatusDeniedBothRoutes(fixture, rejected, commercial, 404);
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("UPDATE tenant_membership SET status='ACTIVE' WHERE membership_id='" + member + "'");
+                statement.executeUpdate("UPDATE tenant SET status='SUSPENDED' WHERE tenant_id='" + fixture.tenant() + "'");
+            }
+            assertStatusDeniedBothRoutes(fixture, rejected, commercial, 404);
+            assertEquals(before, productRows(fixture.tenant()));
+            assertEquals(auditBefore, sqlCount("SELECT count(*) FROM audit_event WHERE tenant_id=? AND action='PRODUCT_STATUS_CHANGED'", fixture.tenant()));
+        } finally {
+            try (var connection = dataSource.getConnection(); var statement = connection.createStatement()) {
+                statement.executeUpdate("UPDATE user_account SET status='ACTIVE' WHERE user_id='" + actor + "'");
+            }
+        }
+    }
+
+    private void assertStatusDeniedBothRoutes(StatusFixture fixture, String product, String token, int expected) {
+        var single = given().contentType("application/json").body("{\"target\":\"ACTIVE\",\"version\":0}");
+        var batch = given().contentType("application/json").body("{\"target\":\"ACTIVE\",\"items\":[{\"productId\":\"" + product + "\",\"version\":0}]}");
+        if (token != null) {
+            single.auth().oauth2(token);
+            batch.auth().oauth2(token);
+        }
+        single.patch(fixture.products() + "/" + product + "/status").then().statusCode(expected);
+        batch.post(fixture.products() + "/status-changes").then().statusCode(expected);
+    }
+
     private record StatusFixture(UUID tenant, String category, String products) { }
 
     private StatusFixture statusFixture(String admin) throws Exception {
